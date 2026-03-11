@@ -35,8 +35,10 @@
 #include "cstrike/entity/CBaseWeapon.h"
 #include "cstrike/entity/CEnvEntityMaker.h"
 #include "cstrike/entity/CHudHint.h"
+#include "cstrike/entity/CLogicCase.h"
 #include "cstrike/entity/CPhysBox.h"
 #include "cstrike/entity/CPhysForce.h"
+#include "cstrike/entity/CPointHurt.h"
 #include "cstrike/entity/CTriggerPush.h"
 #include "cstrike/entity/PlayerController.h"
 #include "cstrike/entity/PlayerPawn.h"
@@ -578,17 +580,19 @@ using AddOutputHandler_t = void (*)(const CEntityIdentity* pInstance, const char
 
 struct AddOutputKey_t
 {
-    AddOutputKey_t(const char* pName, size_t parts)
+    AddOutputKey_t(const char* pName, size_t parts, bool prefix = false)
     {
-        m_sName  = std::string(pName);
-        m_nParts = parts;
+        m_sName   = std::string(pName);
+        m_nParts  = parts;
+        m_bPrefix = prefix;
     }
 
     AddOutputKey_t(const AddOutputKey_t& other) :
-        m_sName(other.m_sName), m_nParts(other.m_nParts) {}
+        m_sName(other.m_sName), m_nParts(other.m_nParts), m_bPrefix(other.m_bPrefix) {}
 
     std::string m_sName;
     size_t      m_nParts;
+    bool        m_bPrefix = false;
 };
 
 inline static bool GetVariantInt(const Variant_t* pValue, int& value)
@@ -748,14 +752,14 @@ static void AddOutputCustom_EntityTemplate(const CEntityIdentity* pInstance, con
 
 static void AddOutputCustom_BaseVelocity(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, const std::vector<std::string>& vecArgs)
 {
-    const Vector velocity(std::clamp(static_cast<float>(atof(vecArgs[1].c_str())), -3500.f, 3500.f), std::clamp(static_cast<float>(atof(vecArgs[2].c_str())), -3500.f, 3500.f), std::clamp(static_cast<float>(atof(vecArgs[3].c_str())), -3500.f, 3500.f));
+    const Vector velocity(std::clamp(static_cast<float>(atof(vecArgs[1].c_str())), -4096.f, 4096.f), std::clamp(static_cast<float>(atof(vecArgs[2].c_str())), -4096.f, 4096.f), std::clamp(static_cast<float>(atof(vecArgs[3].c_str())), -4096.f, 4096.f));
     const auto   pEntity = pInstance->GetBaseEntity();
     pEntity->m_vecBaseVelocity(velocity);
 }
 
 static void AddOutputCustom_AbsVelocity(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, const std::vector<std::string>& vecArgs)
 {
-    Vector velocity(std::clamp(static_cast<float>(atof(vecArgs[1].c_str())), -3500.f, 3500.f), std::clamp(static_cast<float>(atof(vecArgs[2].c_str())), -3500.f, 3500.f), std::clamp(static_cast<float>(atof(vecArgs[3].c_str())), -3500.f, 3500.f));
+    Vector velocity(std::clamp(static_cast<float>(atof(vecArgs[1].c_str())), -4096.f, 4096.f), std::clamp(static_cast<float>(atof(vecArgs[2].c_str())), -4096.f, 4096.f), std::clamp(static_cast<float>(atof(vecArgs[3].c_str())), -4096.f, 4096.f));
     pInstance->GetBaseEntity()->SetAbsVelocity(&velocity);
 }
 
@@ -907,6 +911,100 @@ static void AddOutputCustom_CanBePickedUp(const CEntityIdentity* pInstance, cons
     }
 }
 
+static void AddOutputCustom_Damage(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, const std::vector<std::string>& vecArgs)
+{
+    const auto pEntity = reinterpret_cast<CPointHurt*>(pInstance->GetBaseEntity());
+
+    if (strcasecmp(pEntity->GetClassname(), "point_hurt") == 0)
+    {
+        const auto value = std::clamp((int)atoi(vecArgs[1].c_str()), 0, INT_MAX);
+        pEntity->m_nDamage(value);
+
+        if (ms_entity_io_verbose_logging->GetValue<bool>())
+        {
+            LOG("Set damage to %d for %s", value, pEntity->GetName());
+        }
+    }
+    else
+    {
+        InputErrorCustomNoParam("Only point_hurt is supported");
+    }
+}
+
+static void AddOutputCustom_DamageType(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, const std::vector<std::string>& vecArgs)
+{
+    const auto pEntity = reinterpret_cast<CPointHurt*>(pInstance->GetBaseEntity());
+
+    if (strcasecmp(pEntity->GetClassname(), "point_hurt") == 0)
+    {
+        const auto value = std::clamp((int)atoi(vecArgs[1].c_str()), 0, INT_MAX);
+        pEntity->m_bitsDamageType(value);
+
+        if (ms_entity_io_verbose_logging->GetValue<bool>())
+        {
+            LOG("Set damagetype to %d for %s", value, pEntity->GetName());
+        }
+    }
+    else
+    {
+        InputErrorCustomNoParam("Only point_hurt is supported");
+    }
+}
+
+static void AddOutputCustom_DamageRadius(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, const std::vector<std::string>& vecArgs)
+{
+    const auto pEntity = reinterpret_cast<CPointHurt*>(pInstance->GetBaseEntity());
+
+    if (strcasecmp(pEntity->GetClassname(), "point_hurt") == 0)
+    {
+        const auto value = static_cast<float>(atof(vecArgs[1].c_str()));
+        pEntity->m_flRadius(value);
+
+        if (ms_entity_io_verbose_logging->GetValue<bool>())
+        {
+            LOG("Set damageradius to %f for %s", value, pEntity->GetName());
+        }
+    }
+    else
+    {
+        InputErrorCustomNoParam("Only point_hurt is supported");
+    }
+}
+
+static void AddOutputCustom_Case(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, const std::vector<std::string>& vecArgs)
+{
+    const auto pEntity = reinterpret_cast<CLogicCase*>(pInstance->GetBaseEntity());
+
+    if (strcasecmp(pEntity->GetClassname(), "logic_case") == 0)
+    {
+        if (vecArgs[0].length() != 6)
+        {
+            WARN("%d.%s Error Input '%s': size must be 6", pInstance->GetEntityIndex(), pInstance->GetName(), vecArgs[0].c_str());
+            return;
+        }
+
+        const int iCase = atoi(vecArgs[0].substr(4).c_str());
+
+        if (iCase < 1 || iCase > 32)
+        {
+            WARN("%d.%s Error Input '%s': case number must be between 01-32", pInstance->GetEntityIndex(), pInstance->GetName(), vecArgs[0].c_str());
+            return;
+        }
+
+        const auto& pValue                   = g_pGameEntitySystem->AllocPooledString(vecArgs[1].c_str());
+        pEntity->m_nCase()[iCase - 1] = pValue;
+
+        if (ms_entity_io_verbose_logging->GetValue<bool>())
+        {
+            LOG("Set %s to %s for %s", vecArgs[0].c_str(), pValue.Get(), pInstance->GetName());
+        }
+    }
+    else
+    {
+        InputErrorCustomNoParam("Only logic_case is supported");
+    }
+}
+
 const std::vector<AddOutputInfo_t> s_AddOutputHandlers = {
     {{"targetname", 2},     AddOutputCustom_Targetname    },
     {{"origin", 4},         AddOutputCustom_Origin        },
@@ -928,32 +1026,49 @@ const std::vector<AddOutputInfo_t> s_AddOutputHandlers = {
     {{"speed", 2},          AddOutputCustom_Speed         },
     {{"runspeed", 2},       AddOutputCustom_RunSpeed      },
     {{"canbepickedup", 2},  AddOutputCustom_CanBePickedUp },
+    {{"damage", 2},         AddOutputCustom_Damage        },
+    {{"damagetype", 2},     AddOutputCustom_DamageType    },
+    {{"damageradius", 2},   AddOutputCustom_DamageRadius  },
+    {{"Case", 2, true},     AddOutputCustom_Case          },
 };
 
 static bool CustomInput_CustomAddOutput(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, Variant_t* pValue)
 {
     if (const auto param = pValue->AutoCastString())
     {
-        for (const auto& [input, handler] : s_AddOutputHandlers)
-        {
-            if (strncasecmp(param, input.m_sName.c_str(), input.m_sName.size()) == 0 && param[input.m_sName.size()] == ' ')
-            {
-                const auto split = StringSplit(param, " ");
+        const auto split = StringSplit(param, " ");
 
-                if (split.size() == input.m_nParts)
+        if (!split.empty())
+        {
+            for (const auto& [input, handler] : s_AddOutputHandlers)
+            {
+                bool matched = false;
+                if (input.m_bPrefix)
                 {
-                    handler(pInstance, pInput, pActivator, pCaller, split);
+                    matched = strncasecmp(split[0].c_str(), input.m_sName.c_str(), input.m_sName.size()) == 0;
                 }
                 else
                 {
-                    InputErrorParam();
+                    matched = strcasecmp(split[0].c_str(), input.m_sName.c_str()) == 0;
                 }
 
-                return true;
-            }
-        }
+                if (matched)
+                {
+                    if (split.size() == input.m_nParts)
+                    {
+                        handler(pInstance, pInput, pActivator, pCaller, split);
+                    }
+                    else
+                    {
+                        InputErrorParam();
+                    }
 
-        WARN("Unknown param '%s' for entity %d.%s.%s", param, pInstance->GetEntityIndex(), pInstance->GetClassname(), pInstance->GetName());
+                    return true;
+                }
+            }
+
+            WARN("Unknown param '%s' for entity %d.%s.%s", param, pInstance->GetEntityIndex(), pInstance->GetClassname(), pInstance->GetName());
+        }
     }
 
     // always handled;
