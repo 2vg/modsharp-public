@@ -752,14 +752,14 @@ static void AddOutputCustom_EntityTemplate(const CEntityIdentity* pInstance, con
 
 static void AddOutputCustom_BaseVelocity(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, const std::vector<std::string>& vecArgs)
 {
-    const Vector velocity(std::clamp(static_cast<float>(atof(vecArgs[1].c_str())), -3500.f, 3500.f), std::clamp(static_cast<float>(atof(vecArgs[2].c_str())), -3500.f, 3500.f), std::clamp(static_cast<float>(atof(vecArgs[3].c_str())), -3500.f, 3500.f));
+    const Vector velocity(std::clamp(static_cast<float>(atof(vecArgs[1].c_str())), -4096.f, 4096.f), std::clamp(static_cast<float>(atof(vecArgs[2].c_str())), -4096.f, 4096.f), std::clamp(static_cast<float>(atof(vecArgs[3].c_str())), -4096.f, 4096.f));
     const auto   pEntity = pInstance->GetBaseEntity();
     pEntity->m_vecBaseVelocity(velocity);
 }
 
 static void AddOutputCustom_AbsVelocity(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, const std::vector<std::string>& vecArgs)
 {
-    Vector velocity(std::clamp(static_cast<float>(atof(vecArgs[1].c_str())), -3500.f, 3500.f), std::clamp(static_cast<float>(atof(vecArgs[2].c_str())), -3500.f, 3500.f), std::clamp(static_cast<float>(atof(vecArgs[3].c_str())), -3500.f, 3500.f));
+    Vector velocity(std::clamp(static_cast<float>(atof(vecArgs[1].c_str())), -4096.f, 4096.f), std::clamp(static_cast<float>(atof(vecArgs[2].c_str())), -4096.f, 4096.f), std::clamp(static_cast<float>(atof(vecArgs[3].c_str())), -4096.f, 4096.f));
     pInstance->GetBaseEntity()->SetAbsVelocity(&velocity);
 }
 
