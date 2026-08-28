@@ -65,9 +65,12 @@ ISteamApiProxy*                   g_pSteamApiProxy      = &g_SteamApiProxy;
 uint64_t                          g_unDualAddonId       = 0;
 bool                              g_bDualAddonAvailable = false;
 
+extern "C" void ExtraAddon_OnSteamDownloadItemResult(uint64_t fileId, int eResult);
+
 void InitApiContext()
 {
-    if (CommandLine()->HasParam("-dual_addon"))
+    static bool initDualAddonId = false;
+    if (!initDualAddonId && CommandLine()->HasParam("-dual_addon"))
     {
         if (const auto pszValue = CommandLine()->ParamValue("-dual_addon", nullptr))
         {
@@ -77,6 +80,8 @@ void InitApiContext()
                 LOG("Load dual addon = %llu", ugcId);
             }
         }
+
+        initDualAddonId = true;
     }
 
     g_SteamGameServerAPIContext.Init();
@@ -93,7 +98,6 @@ void DestroyApiContext()
 {
     delete g_pCallbackListener;
     g_pCallbackListener = nullptr;
-    g_unDualAddonId     = 0;
     g_SteamApiProxy.SetSteamServer(nullptr);
     g_SteamApiProxy.SetSteamUGC(nullptr);
     g_SteamGameServerAPIContext.Clear();
@@ -106,6 +110,20 @@ uint64_t GetDualAddonId()
 #else
     return g_unDualAddonId;
 #endif
+}
+
+bool SetDualAddonId(uint64_t publishId)
+{
+    if (!CommandLine()->HasParam("-dual_addon"))
+        return false;
+
+    const auto old  = g_unDualAddonId;
+    g_unDualAddonId = publishId;
+
+    if (old != publishId)
+        LOG("Dual AddonId changed to %llu from %llu", publishId, old);
+
+    return true;
 }
 
 void CallbackListener::OnGroupStatusResult(GSClientGroupStatus_t* pParam)
@@ -165,6 +183,8 @@ void CallbackListener::OnDownloadItemResult(DownloadItemResult_t* pParam)
         LogInfo("Downloaded addon %llu", id);
     }
 #endif
+
+    ExtraAddon_OnSteamDownloadItemResult(id, pParam->m_eResult);
 
     forwards::OnDownloadItemResult->Invoke(id, pParam->m_eResult);
 }

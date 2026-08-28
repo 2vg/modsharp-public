@@ -55,4 +55,8 @@ public interface ISharedSystem
     ISharpModuleManager GetSharpModuleManager();
 
     IParticleManager GetParticleManager();
+
+    IAddonManager GetAddonManager();
+
+    IScriptManager GetScriptManager();
 }
