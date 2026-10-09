@@ -41,8 +41,8 @@
 #include "cstrike/type/CTrace.h"
 #include "cstrike/type/ResourceSystem.h"
 
-extern void DualMountAddonOverrideClientCheck(SteamId_t steamId, double time);
-extern void DualMountAddonPurgeClientCheck();
+#include "manager/AddonManager.h"
+
 
 namespace google::protobuf
 {
@@ -99,8 +99,6 @@ static void TerminateRound(float delay, uint32_t reason, bool bypassHook, TeamRe
     gameRules->TerminateRound(delay, reason, bypassHook, info, size);
 }
 
-// HACK 这里因为返回值问题可能导致C#传参问题
-static CTraceResult_t g_TraceResult = {};
 class CTraceFilterCustom : public CTraceFilter
 {
 public:
@@ -284,14 +282,45 @@ static CCSWeaponBaseVData* FindWeaponVDataByName(const char* name)
     return address::server::FindWeaponVDataByName(1, name);
 }
 
-static void DualAddonPurgeCheck()
+static NativeSpan<uint64_t> AddonGetAddons()
 {
-    ::DualMountAddonPurgeClientCheck();
+    const auto& addons = g_AddonManager.GetAddons();
+    return NativeSpan(const_cast<uint64_t*>(addons.data()), static_cast<int>(addons.size()));
 }
 
-static void DualAddonOverrideCheck(SteamId_t steamId, double time)
+static void AddonSetAddons(const uint64_t* pAddons, int count)
 {
-    ::DualMountAddonOverrideClientCheck(steamId, time);
+    g_AddonManager.SetAddons(std::vector(pAddons, pAddons + count));
+}
+
+static void AddonResetClientCache(SteamId_t steamId)
+{
+    g_AddonManager.ResetClientCache(steamId);
+}
+
+static bool AddonRefreshClient(SteamId_t steamId, bool resetCache)
+{
+    return g_AddonManager.RefreshClient(steamId, resetCache);
+}
+
+static bool AddonUpdateAddon(uint64_t fileId, bool reloadMap)
+{
+    return g_AddonManager.UpdateAddon(fileId, reloadMap);
+}
+
+static void AddonReloadMap()
+{
+    g_AddonManager.ReloadMap();
+}
+
+static void AddonSetOptions(float clientTimeout, float connectionTimeout, float cacheDuration, bool debug)
+{
+    g_AddonManager.SetOptions(clientTimeout, connectionTimeout, cacheDuration, debug);
+}
+
+static void AddonSetClientQueryEnabled(bool enabled)
+{
+    g_AddonManager.SetClientQueryEnabled(enabled);
 }
 
 static bool AddWorkshopMap(uint64_t sharedFileId, const char* mapName, const char* path)
@@ -351,8 +380,14 @@ void Init()
 
     bridge::CreateNative("Game.GetGameSystemFactory", reinterpret_cast<void*>(GetGameSystemFactory));
 
-    bridge::CreateNative("Game.DualAddonPurgeCheck", reinterpret_cast<void*>(DualAddonPurgeCheck));
-    bridge::CreateNative("Game.DualAddonOverrideCheck", reinterpret_cast<void*>(DualAddonOverrideCheck));
+    bridge::CreateNative("Game.AddonGetAddons", reinterpret_cast<void*>(AddonGetAddons));
+    bridge::CreateNative("Game.AddonSetAddons", reinterpret_cast<void*>(AddonSetAddons));
+    bridge::CreateNative("Game.AddonResetClientCache", reinterpret_cast<void*>(AddonResetClientCache));
+    bridge::CreateNative("Game.AddonRefreshClient", reinterpret_cast<void*>(AddonRefreshClient));
+    bridge::CreateNative("Game.AddonUpdateAddon", reinterpret_cast<void*>(AddonUpdateAddon));
+    bridge::CreateNative("Game.AddonReloadMap", reinterpret_cast<void*>(AddonReloadMap));
+    bridge::CreateNative("Game.AddonSetOptions", reinterpret_cast<void*>(AddonSetOptions));
+    bridge::CreateNative("Game.AddonSetClientQueryEnabled", reinterpret_cast<void*>(AddonSetClientQueryEnabled));
 
     bridge::CreateNative("Game.AddWorkshopMap", reinterpret_cast<void*>(AddWorkshopMap));
     bridge::CreateNative("Game.WorkshopMapExists", reinterpret_cast<void*>(WorkshopMapExists));

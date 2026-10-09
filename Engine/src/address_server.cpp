@@ -27,11 +27,49 @@
 #include "cstrike/interface/ICvar.h"
 #include "cstrike/interface/IGameSystem.h"
 #include "cstrike/schema.h"
+#include "cstrike/type/CCSScript.h"
 #include "cstrike/type/CEntityClass.h"
 
 #include <ranges>
 
 class CBaseGameSystemFactory;
+
+void ResolveProcessClientSvcUserMessage()
+{
+    auto svr_mod = modules::server;
+
+    auto message_vtable  = svr_mod->GetVirtualTableByName("CCSUsrMsg_CustomHudClicked_t");
+    auto layout_typeinfo = svr_mod->GetTypeInfoFromName("CCSCustomHudLayout");
+    if (!message_vtable.IsValid() || !layout_typeinfo.IsValid())
+    {
+        WARN("Failed to resolve ProcessClientSvcUserMessage references.");
+        return;
+    }
+
+    auto message_refs = svr_mod->GetReferenceRange(message_vtable);
+    auto layout_refs  = svr_mod->GetReferenceRange(layout_typeinfo);
+    if (message_refs.empty() || layout_refs.empty())
+    {
+        WARN("Failed to resolve ProcessClientSvcUserMessage references.");
+        return;
+    }
+
+    std::vector<std::span<const CModule::ReferenceEntry>> reference_sets{
+        message_refs,
+        layout_refs,
+    };
+
+    auto candidates = svr_mod->IntersectFunctionReferences(reference_sets);
+    if (candidates.size() != 1)
+    {
+        WARN("Failed to resolve ProcessClientSvcUserMessage: found %zu candidates.", candidates.size());
+        return;
+    }
+
+    auto resolved                                = candidates.front();
+    address::server::ProcessClientSvcUserMessage = reinterpret_cast<address::server::ProcessClientSvcUserMessage_t>(resolved);
+    FLOG("Found ProcessClientSvcUserMessage at server+0x%llx", resolved - svr_mod->Base());
+}
 
 void FindCEntityIdentity_SetEntityName()
 {
@@ -137,9 +175,9 @@ void FindGameSystemFactory()
                     return false;
                 }
 
-                if (!modules::server->IsPointerDerivedFrom(first->m_pInstance, "IGameSystem"))
+                if (!modules::server->IsPointerDerivedFrom(first, "IGameSystemFactory"))
                 {
-                    WARN("Candidate at server+0x%llx rejected: m_pInstance is not derived from IGameSystem", pending_addr - modules::server->Base());
+                    WARN("Candidate at server+0x%llx rejected: head is not derived from IGameSystemFactory", pending_addr - modules::server->Base());
                     pending_reg  = ZYDIS_REGISTER_NONE;
                     pending_addr = 0;
                     return false;
@@ -1018,6 +1056,8 @@ void ResolveCBaseEntity_AbsOrigin()
     if (!func.IsValid())
     {
         WARN("Failed to find OnC4Explode (string 'c4.explode').");
+        AssignOrFallback(svr_mod, address::server::CBaseEntity_AbsOrigin, 0, "CBaseEntity::GetAbsOrigin", "CBaseEntity::AbsOrigin");
+        AssignOrFallback(svr_mod, address::server::CBaseEntity_SetAbsOrigin, 0, "CBaseEntity::SetAbsOrigin");
         return;
     }
 
@@ -1025,6 +1065,8 @@ void ResolveCBaseEntity_AbsOrigin()
     if (!range)
     {
         WARN("Failed to get function range for OnC4Explode.");
+        AssignOrFallback(svr_mod, address::server::CBaseEntity_AbsOrigin, 0, "CBaseEntity::GetAbsOrigin", "CBaseEntity::AbsOrigin");
+        AssignOrFallback(svr_mod, address::server::CBaseEntity_SetAbsOrigin, 0, "CBaseEntity::SetAbsOrigin");
         return;
     }
 

@@ -164,14 +164,11 @@ public:
     [[nodiscard]] bool        Bool() const { return (fieldType == FieldType_t::FIELD_BOOLEAN) ? bVal : false; }
     [[nodiscard]] float       Float() const { return (fieldType == FieldType_t::FIELD_FLOAT32) ? flVal : 0; }
     [[nodiscard]] const char* CString() const { return (fieldType == FieldType_t::FIELD_CSTRING) ? iszVal : nullptr; }
-    [[nodiscard]] const char* String() const { return (fieldType == FieldType_t::FIELD_STRING) ? (pVal ? *reinterpret_cast<char**>(pVal) : nullptr) : nullptr; }
+    [[nodiscard]] const char* String() const { return (fieldType == FieldType_t::FIELD_STRING) ? iszVal : nullptr; }
     [[nodiscard]] const char* AutoString() const
     {
-        if (fieldType == FieldType_t::FIELD_CSTRING)
+        if (fieldType == FieldType_t::FIELD_CSTRING || fieldType == FieldType_t::FIELD_STRING || fieldType == FieldType_t::FIELD_GLOBALSYMBOL)
             return iszVal;
-
-        if (fieldType == FieldType_t::FIELD_STRING || fieldType == FieldType_t::FIELD_GLOBALSYMBOL)
-            return pVal ? *reinterpret_cast<const char**>(pVal) : nullptr;
 
         return nullptr;
     }
@@ -253,12 +250,12 @@ struct KeyValuesVariantValueItem
 {
     KeyValuesVariantValueItemType type;
     union {
-        bool     bValue;
-        int32_t  i32Value;
-        float    flValue;
-        char*    szValue;
-        void*    pValue;
-        uint64_t u64Value;
+        bool        bValue;
+        int32_t     i32Value;
+        float       flValue;
+        const char* szValue;
+        void*       pValue;
+        uint64_t    u64Value;
     };
 
     // 如果是string确保 this alive
@@ -297,7 +294,7 @@ static_assert(sizeof(KeyValuesVariantValueItem) == 16);
 
 struct KeyValuesVariantItem
 {
-    char*                     Key;
+    const char*               Key;
     KeyValuesVariantValueItem Value;
 };
 static_assert(sizeof(KeyValuesVariantItem) == 24);

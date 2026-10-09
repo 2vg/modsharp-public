@@ -21,6 +21,7 @@
 #define CSTRIKE_INTERFACE_NETWORK_H
 
 #include "cstrike/interface/IAppSystem.h"
+#include "cstrike/interface/INetChannel.h"
 
 #include <cstdint>
 
@@ -51,7 +52,7 @@ public:
     virtual const char*       GetUnscopedName()   = 0;
     virtual NetMessageInfo_t* GetNetMessageInfo() = 0;
 
-    virtual void SetMessageId(unsigned short nMessageId) = 0;
+    virtual void SetMessageId(int nMessageId) = 0;
 
     virtual void AddCategoryMask(int nMask, bool) = 0;
 
@@ -85,6 +86,9 @@ public:
 
     virtual void* AllocAndCopy() const = 0;
 
+    virtual int         GetType() const = 0;
+    virtual const char* GetName() const = 0;
+
     // Helper function to cast up the abstract message to a concrete CNetMessagePB<T> type.
     // Doesn't do any validity checks itself!
     template <typename T>
@@ -100,8 +104,16 @@ public:
     }
 
 private:
-    char pad[0x28];
+    void*    m_pUnk08{};
+    uint32_t m_nUnk10{};
+    uint8_t  m_nUnk14{0xFF};
+    uint8_t  m_nUnk15[3]{};
+    int64_t  m_nUnk18{-1};
+    float    m_flUnk20{-1.0f};
+    uint32_t m_nUnk24{};
+    int64_t  m_nUnk28{-1};
 };
+static_assert(sizeof(CNetMessage) == 0x30);
 
 // AMNOTE: This is a stub class over real CNetMessagePB!
 // This is mainly to access the game constructed objects, and not for direct initialization of them
@@ -206,7 +218,7 @@ private:
     virtual void Method_47() = 0;
 
 public:
-    virtual void RejectNetChannel(void* pNetInfo, uint32_t reason, void* pUnknown = nullptr) = 0;
+    virtual void RejectNetChannel(uint32_t hNetInfo, uint32_t reason, void* pUnknown = nullptr) = 0;
 };
 
 class IGameEventSystem : public IAppSystem
@@ -220,8 +232,8 @@ public:
 
     // BUG 这两兄弟在dll/so里面的位置跟这里相反, 我也不知道为什么
     // 大概率是编译器优化Overload
-    virtual void PostEventAbstract(uint32_t nSlot, bool bLocalOnly, uint32_t nClientCount, const uint64_t* clients, INetworkMessageInternal* pEvent, const void* pData, uint64_t nSize, bool bReliable) = 0;
-    virtual void PostEventAbstract(uint32_t nSlot, bool bLocalOnly, IRecipientFilter* pFilter, INetworkMessageInternal* pEvent, const void* pData, uint64_t nSize)                                      = 0;
+    virtual void PostEventAbstract(uint32_t nSlot, bool bLocalOnly, uint32_t nClientCount, const uint64_t* clients, INetworkMessageInternal* pEvent, const void* pData, uint64_t nSize, NetChannelBufType_t nReliable) = 0;
+    virtual void PostEventAbstract(uint32_t nSlot, bool bLocalOnly, IRecipientFilter* pFilter, INetworkMessageInternal* pEvent, const void* pData, uint64_t nSize)                                                     = 0;
 
 private:
     virtual void PostEntityEventAbstract(void* handle, INetworkMessageInternal* pEvent, const void* pData, unsigned long nSize, bool bReliable) = 0;

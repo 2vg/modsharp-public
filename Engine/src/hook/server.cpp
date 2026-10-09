@@ -38,6 +38,7 @@
 #include "cstrike/type/CNetworkGameServer.h"
 #include "cstrike/type/CServerSideClient.h"
 #include "cstrike/type/VProf.h"
+#include "cstrike/type/Vector.h"
 
 #include <Zydis.h>
 #include <safetyhook.hpp>
@@ -46,6 +47,8 @@
 
 static bool             s_bPatchVScriptVM;
 static CConVarBaseData* ms_fix_spawngroups_leak = nullptr;
+
+extern void AddonsOnSteamApiActivated();
 
 BeginMemberHookScope(CSource2Server)
 {
@@ -84,6 +87,7 @@ BeginMemberHookScope(CSource2Server)
 
         GameServerSteamAPIActivated(pServer);
         InitApiContext();
+        AddonsOnSteamApiActivated();
     }
 
     DeclareVirtualHook(GameServerSteamAPIDeactivated, void, (CSource2Server * pServer))
@@ -137,7 +141,7 @@ BeginMemberHookScope(CGameRulesGameSystem)
 
         forwards::OnGamePostInit->Invoke();
 
-        g_pSpawnGroupMgr = *static_cast<IGameSpawnGroupMgr**>(FindGameSystemByName("SpawnGroupManagerGameSystem"));
+        g_pSpawnGroupMgr = static_cast<IGameSpawnGroupMgr*>(FindGameSystemByName("SpawnGroupManagerGameSystem"));
         AssertPtr(g_pSpawnGroupMgr);
     }
 
@@ -237,7 +241,7 @@ BeginMemberHookScope(CGameRulesGameSystem)
 class CNavMesh;
 BeginMemberHookScope(CNavMesh)
 {
-    DeclareMemberDetourHook(GetNearestNavArea, void*, (void*, float*, unsigned int*, unsigned int, int64_t, int64_t, float, int64_t))
+    DeclareMemberDetourHook(GetNearestNavArea, void*, (void*, Vector*, uint32_t*, uint32_t, int64_t, float, int64_t))
     {
         return nullptr;
     }
@@ -254,9 +258,9 @@ BeginMemberHookScope(CCSGOVScriptGameSystem)
 
 BeginMemberHookScope(IScriptVM)
 {
-    DeclareMemberDetourHook(CreateVM, bool, (IScriptVM * pScriptVM))
+    DeclareMemberDetourHook(CreateVM, bool, (IScriptVM * pScriptVM, bool bLoadDebugLibrary))
     {
-        const auto value = CreateVM(pScriptVM);
+        const auto value = CreateVM(pScriptVM, bLoadDebugLibrary);
 
         if (value)
         {

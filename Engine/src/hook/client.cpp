@@ -24,10 +24,14 @@
 #include "manager/ConVarManager.h"
 #include "manager/HookManager.h"
 #include "module.h"
+#include "sdkproxy.h"
 
 #include "CoreCLR/RuntimeProtobufMessage.h"
 
+#include "cstrike/entity/CBaseEntity.h"
+#include "cstrike/entity/CCSCustomHudLayout.h"
 #include "cstrike/entity/PlayerController.h"
+#include "cstrike/interface/CGameEntitySystem.h"
 #include "cstrike/interface/ICvar.h"
 #include "cstrike/interface/IMemAlloc.h"
 #include "cstrike/interface/INetwork.h"
@@ -38,10 +42,13 @@
 #include "cstrike/type/CServerSideClient.h"
 #include "cstrike/type/VProf.h"
 
+#include <proto/cstrike15_usermessages.pb.h>
 #include <proto/netmessages.pb.h>
+
 #include <safetyhook.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <random>
 #include <string>
 
@@ -57,8 +64,11 @@ constexpr int32_t NET_MESSAGE_ID_VOICE = 47;
 static CConVarBaseData* ms_log_chat              = nullptr;
 static CConVarBaseData* ms_chat_block_whitespace = nullptr;
 static CConVarBaseData* ms_fix_voice_chat        = nullptr;
+static CConVarBaseData* ms_voice_lag_should_kick = nullptr;
 static uint64_t         s_RandomSeed;
 static uint64_t         s_PlayerSeed[CS_MAX_PLAYERS];
+
+extern void BanSteamIdInternal(uint64_t steamId, int32_t reason);
 
 BeginMemberHookScope(CSource2GameClients)
 {
@@ -206,11 +216,11 @@ BeginMemberHookScope(CSource2GameClients)
         g_pHookManager->Call_ClientFullyConnect(HookType_Post, slot);
     }
 
-    DeclareMemberDetourHook(PutInServer, void, (IServerGameClient * pServerGameClient, PlayerSlot_t slot, const char* pszName, SteamId_t steamId))
+    DeclareMemberDetourHook(PutInServer, void, (IServerGameClient * pServerGameClient, PlayerSlot_t slot, const char* pszName, int32_t nClientType, SteamId_t steamId))
     {
         g_pHookManager->Call_ClientPutInServer(HookType_Pre, slot, pszName, steamId);
 
-        PutInServer(pServerGameClient, slot, pszName, steamId);
+        PutInServer(pServerGameClient, slot, pszName, nClientType, steamId);
 
         g_pHookManager->Call_ClientPutInServer(HookType_Post, slot, pszName, steamId);
 
@@ -286,6 +296,9 @@ BeginMemberHookScope(CServerSideClient)
 
         const auto pCommandString = pConCommand->command().c_str();
 
+        if (!pCommandString || !*pCommandString)
+            return false;
+
 #ifdef CLIENT_HOOK_ASSERT
         LOG("%10s: 0%p -> %s(%d) %llu\n"
             "%10s: %s\n"
@@ -295,9 +308,27 @@ BeginMemberHookScope(CServerSideClient)
         if (natives::client::PostCommand(pClient, pCommandString) == ECommandAction::Stopped)
             return true;
 
-        const auto result = ExecuteStringCommand(pClient, pConCommand);
+        if (!pClient->IsInGame() && V_stristr_fast(pCommandString, "say") != nullptr)
+        {
+            CCommand command{};
+            if (!command.Tokenize(pCommandString))
+                return false;
 
-        return result;
+            const auto c = command.Arg(0);
+            if (!c || c[0] == 0)
+                return false;
+
+            if (strncasecmp(c, "say", 3) == 0)
+            {
+                if (ms_log_chat->GetValue<bool>())
+                    LOG("Blocked chat command from not-in-game client %s<%d>: %s",
+                        pClient->GetName(), static_cast<int32_t>(pClient->GetSlot()), pCommandString);
+
+                return true;
+            }
+        }
+
+        return ExecuteStringCommand(pClient, pConCommand);
     }
 
     DeclareMemberDetourHook(IsHearingClient, bool, (CServerSideClient * pClient, int32_t nSlot))
@@ -324,28 +355,231 @@ BeginMemberHookScope(CServerSideClient)
         return IsHearingClient(pClient, nSlot);
     }
 
+    struct CmdKeyValuesRateState
+    {
+        const CServerSideClient* client         = nullptr;
+        double                   lastRefillTime = -1.0;
+        double                   tokens         = CmdKeyValues_BucketCapacity;
+        int32_t                  logging        = 0;
+
+        void Update(double now)
+        {
+            tokens = std::min(CmdKeyValues_BucketCapacity, tokens + (now - lastRefillTime) * CmdKeyValues_RefillRate);
+        }
+
+        [[nodiscard]] bool ShouldLog()
+        {
+            if (tokens < 1.0)
+            {
+                logging++;
+                tokens = CmdKeyValues_BucketCapacity;
+                return true;
+            }
+
+            return false;
+        }
+
+        [[nodiscard]] bool ShouldKick() const
+        {
+            return logging >= 3;
+        }
+
+    private:
+        static constexpr double CmdKeyValues_BucketCapacity = 8.0;
+        static constexpr double CmdKeyValues_RefillRate     = 2.0;
+    };
+
+    static CmdKeyValuesRateState s_CmdKeyValuesRateState[CS_MAX_PLAYERS];
+
+    static void ResetCmdKeyValuesRateState(const PlayerSlot_t slot)
+    {
+        if (slot < CS_MAX_PLAYERS)
+            s_CmdKeyValuesRateState[slot] = {};
+    }
+
+    DeclareMemberDetourHook(CLCMsg_CmdKeyValues, bool, (CServerSideClient * pClient, CNetMessage * pMessage))
+    {
+        if (!pClient || !pMessage)
+            return false;
+
+        const auto now   = Plat_FloatTime();
+        auto&      state = s_CmdKeyValuesRateState[pClient->GetSlot()];
+        if (state.client != pClient || state.lastRefillTime < 0.0 || now < state.lastRefillTime)
+        {
+            state        = {};
+            state.client = pClient;
+        }
+        else
+        {
+            state.Update(now);
+        }
+
+        state.lastRefillTime = now;
+        state.tokens -= 1.0;
+
+        if (state.ShouldKick())
+        {
+            FLOG("Rejected CCLCMsg_CmdKeyValues from %s<%llu>: kicked", pClient->GetName(), pClient->GetSteamId());
+            BanSteamIdInternal(pClient->GetSteamId(), 13);
+            return false;
+        }
+
+        if (state.ShouldLog())
+        {
+            WARN("Rejected CCLCMsg_CmdKeyValues from %s<%llu>: dropped", pClient->GetName(), pClient->GetSteamId());
+            return true;
+        }
+
+        return CLCMsg_CmdKeyValues(pClient, pMessage);
+    }
+
+    constexpr uint32_t max_message_rate             = 256;
+    constexpr uint64_t max_decoded_bytes_per_second = 65536;
+    constexpr uint64_t max_message_bytes            = 16384;
+    constexpr uint32_t max_packet_offsets           = 64;
+    constexpr uint32_t max_packets_per_second       = 1024;
+
+    struct VoiceMessageSample
+    {
+        double   time            = 0.0;
+        uint64_t decodedWorkSize = 0;
+        uint32_t packetCount     = 0;
+    };
+
+    struct VoiceMessageRateState
+    {
+        VoiceMessageSample samples[max_message_rate]{};
+
+        double   lastMessageTime = -1.0;
+        double   lastLogTime     = -1.0;
+        uint32_t firstMessage    = 0;
+        uint32_t messageCount    = 0;
+        uint64_t decodedWorkSize = 0;
+        uint32_t packetCount     = 0;
+    };
+
+    static VoiceMessageRateState s_VoiceMessageRateState[CS_MAX_PLAYERS];
+
+    static void ResetVoiceMessageRateState(const PlayerSlot_t slot)
+    {
+        const auto lastLogTime                    = s_VoiceMessageRateState[slot].lastLogTime;
+        s_VoiceMessageRateState[slot]             = {};
+        s_VoiceMessageRateState[slot].lastLogTime = lastLogTime;
+    }
+
+    static bool ShouldKick(const PlayerSlot_t slot, const double now, const uint64_t decodedWorkSize, const uint32_t packetCount)
+    {
+        auto& state = s_VoiceMessageRateState[slot];
+        if (now < state.lastMessageTime)
+            ResetVoiceMessageRateState(slot);
+        state.lastMessageTime = now;
+
+        while (state.messageCount != 0)
+        {
+            const auto& sample = state.samples[state.firstMessage];
+            if (now - sample.time < 1.0)
+                break;
+
+            state.decodedWorkSize -= sample.decodedWorkSize;
+            state.packetCount -= sample.packetCount;
+            state.firstMessage = (state.firstMessage + 1) % max_message_rate;
+            --state.messageCount;
+        }
+
+        if (state.messageCount >= max_message_rate)
+            return true;
+        if (decodedWorkSize > max_decoded_bytes_per_second - state.decodedWorkSize)
+            return true;
+        if (packetCount > max_packets_per_second - state.packetCount)
+            return true;
+
+        const auto index     = (state.firstMessage + state.messageCount) % max_message_rate;
+        state.samples[index] = {now, decodedWorkSize, packetCount};
+        ++state.messageCount;
+        state.decodedWorkSize += decodedWorkSize;
+        state.packetCount += packetCount;
+        return false;
+    }
+
+    static void RejectVoiceMessage(const CServerSideClient* pClient, const double now)
+    {
+        if (ms_voice_lag_should_kick->GetValue<bool>())
+            BanSteamIdInternal(pClient->GetSteamId(), 13);
+
+        auto& state = s_VoiceMessageRateState[pClient->GetSlot()];
+        if (state.lastLogTime < 0.0 || now < state.lastLogTime || now - state.lastLogTime >= 1.0)
+        {
+            state.lastLogTime = now;
+
+            FLOG("Rejected CCLCMsg_VoiceData from %s<%llu>: (tracked_messages=%u tracked_work=%llu tracked_packets=%u)",
+                 pClient->GetName(),
+                 pClient->GetSteamId(),
+                 state.messageCount,
+                 state.decodedWorkSize,
+                 state.packetCount);
+        }
+    }
+
     DeclareVirtualHook(CLCMsg_VoiceData, bool, (CServerSideClient * pClient, CNetMessage * pVoiceData))
     {
-        const auto  msg           = static_cast<const CCLCMsg_VoiceData*>(pVoiceData->AsProto());
+        if (!pClient || !pVoiceData || pClient->IsFakeClient())
+            return false;
+
+        const auto msg = static_cast<const CCLCMsg_VoiceData*>(pVoiceData->AsProto());
+        if (!msg || !msg->has_audio())
+            return false;
+
+        const auto xuid = msg->xuid();
+
+        if (xuid == 0 || xuid != pClient->GetSteamId())
+            return false;
+
         const auto& audio         = msg->audio();
         const auto  sectionNumber = audio.section_number();
+
+        if (!VoiceDataFormat_t_IsValid(audio.format()))
+            return false;
+
+        const auto  now           = Plat_FloatTime();
+        const auto  packetOffsets = static_cast<uint32_t>(audio.packet_offsets_size());
+        const auto  numPackets    = audio.num_packets();
         const auto& voiceData     = audio.voice_data();
         const auto  voiceDataPtr  = voiceData.data();
         const auto  voiceDataSize = voiceData.size();
-        const auto  xuid          = msg->xuid();
+
+        if (voiceDataSize == 0 && (packetOffsets != 0 || numPackets != 0))
+            return false;
+
+        // Check cheap fields before ByteSizeLong walks the protobuf fields.
+        if (packetOffsets > max_packet_offsets || numPackets > max_packet_offsets || voiceDataSize > max_message_bytes)
+            return false;
+
+        const auto messageSize = msg->ByteSizeLong();
+        if (messageSize > max_message_bytes)
+            return false;
+
+        const auto packetCount     = std::max(packetOffsets, numPackets);
+        const auto decodedWorkSize = static_cast<uint64_t>(messageSize) + static_cast<uint64_t>(packetCount) * sizeof(uint32_t);
+        if (ShouldKick(pClient->GetSlot(), now, decodedWorkSize, packetCount))
+        {
+            RejectVoiceMessage(pClient, now);
+
+            // kicked
+            return ms_voice_lag_should_kick->GetValue<bool>() ? false : true;
+        }
 
         const auto action = forwards::OnClientSpeakPre->Invoke(pClient, xuid, sectionNumber, voiceDataPtr, voiceDataSize);
         if (action == EHookAction::SkipCallReturnOverride)
         {
             forwards::OnClientSpeakPost->Invoke(pClient, xuid, sectionNumber, voiceDataPtr, voiceDataSize, action);
-            return true; // always true
+            return true;
         }
 
         if (action == EHookAction::Ignored)
         {
-            CLCMsg_VoiceData(pClient, pVoiceData);
+            const auto result = CLCMsg_VoiceData(pClient, pVoiceData);
             forwards::OnClientSpeakPost->Invoke(pClient, xuid, sectionNumber, voiceDataPtr, voiceDataSize, action);
-            return true;
+            return result;
         }
 
         FatalError("OnClientSpeakPre: unsupported hook action '%s'", EHookActionName(action));
@@ -509,6 +743,42 @@ BeginStaticHookScope(ScriptPrintMessageChatAll)
     }
 }
 
+BeginStaticHookScope(ProcessClientSvcUserMessage)
+{
+    DeclareStaticDetourHook(ProcessClientSvcUserMessage, void, (int32_t nPlayerSlot, int32_t nMsgId, uint32_t nMsgSize, const void* pBuf))
+    {
+        ProcessClientSvcUserMessage(nPlayerSlot, nMsgId, nMsgSize, pBuf);
+
+        if (nMsgId != CS_UM_CustomHudClicked || !pBuf || nMsgSize >= 0xFFFF || nPlayerSlot < 0 || nPlayerSlot >= CS_MAX_PLAYERS)
+            return;
+
+        CCSUsrMsg_CustomHudClicked message;
+        if (!message.ParseFromArray(pBuf, static_cast<int32_t>(nMsgSize)))
+            return;
+
+        if (!message.has_custom_hud_layout() || !message.has_button_id())
+            return;
+
+        const auto packed = message.custom_hud_layout();
+        const auto handle = CBaseHandle::FromPackedValue(packed);
+        if (!handle.IsValid())
+            return;
+
+        static auto vtable = modules::server->GetVirtualTableByName("CCSCustomHudLayout");
+
+        const auto pLayout = g_pGameEntitySystem->FindEntityByIndex<CCSCustomHudLayout*>(handle.GetEntryIndex());
+        if (!pLayout || *reinterpret_cast<const uintptr_t*>(pLayout) != vtable || pLayout->GetActualEHandle().GetPackedValue() != packed)
+            return;
+
+        const auto pController = reinterpret_cast<CCSPlayerController*>(CCSPlayerController::FindBySlot(static_cast<PlayerSlot_t>(nPlayerSlot)));
+
+        if (!pController || !pController->IsConnected())
+            return;
+
+        forwards::OnCustomHudLayoutClicked->Invoke(pController, pLayout, message.button_id().c_str());
+    }
+}
+
 void InstallClientHooks()
 {
     // NOTE 修改初始Seed以避免不同服务器的Seed相同, 再更换服务器后可能出现问题
@@ -525,6 +795,7 @@ void InstallClientHooks()
     HOOK(CSource2GameClients, FullyConnected);
 
     HOOK(CServerSideClient, ExecuteStringCommand);
+    HOOK(CServerSideClient, CLCMsg_CmdKeyValues);
     HOOK(CServerSideClient, IsHearingClient);
     VHOOK(CServerSideClient, CLCMsg_VoiceData, engine);
     VHOOK(CServerSideClient, CLCMsg_RespondCvarValue, engine);
@@ -533,6 +804,15 @@ void InstallClientHooks()
     SHOOK(HostSay);
     SHOOK(ScriptPrintMessageChatAll);
 
+    if (address::server::ProcessClientSvcUserMessage)
+    {
+        SHOOK(ProcessClientSvcUserMessage, {.address = reinterpret_cast<void*>(address::server::ProcessClientSvcUserMessage)});
+    }
+    else
+    {
+        FatalError("ProcessClientSvcUserMessage address unresolved.");
+    }
+
     g_pHookManager->Hook_ClientFullyConnect(HookType_Post, [](PlayerSlot_t slot) {
         const auto pClient = sv->GetClient(slot);
         AssertPtr(pClient);
@@ -540,13 +820,24 @@ void InstallClientHooks()
     });
 
     g_pHookManager->Hook_ClientConnect(HookType_Post, [](PlayerSlot_t slot, const char*, SteamId_t, bool) {
+        if (slot >= CS_MAX_PLAYERS)
+            return;
+        CServerSideClient_Hooks::ResetVoiceMessageRateState(slot);
+        CServerSideClient_Hooks::ResetCmdKeyValuesRateState(slot);
         s_PlayerSeed[slot] = s_RandomSeed;
         s_RandomSeed += 66;
     });
 
+    g_pHookManager->Hook_ClientDisconnect(HookType_Post,
+                                          [](PlayerSlot_t slot, int32_t, const char*, SteamId_t) {
+                                              CServerSideClient_Hooks::ResetVoiceMessageRateState(slot);
+                                              CServerSideClient_Hooks::ResetCmdKeyValuesRateState(slot);
+                                          });
+
     ms_log_chat              = g_ConVarManager.CreateConVar("ms_log_chat", false, "Log chat messages.", FCVAR_RELEASE);
     ms_chat_block_whitespace = g_ConVarManager.CreateConVar("ms_chat_block_whitespace", true, "Block whitespace messages.", FCVAR_RELEASE);
     ms_fix_voice_chat        = g_ConVarManager.CreateConVar("ms_fix_voice_chat", true, "Fix voice chat.", FCVAR_RELEASE);
+    ms_voice_lag_should_kick = g_ConVarManager.CreateConVar("ms_voice_lag_should_kick", false, "Whether to kick the player if attempt to lag the server is detected. True - kick, False - drop the packet", FCVAR_RELEASE);
 }
 
 void ExecuteClientStringCommand(CServerSideClient* pClient, const char* pCommandString)

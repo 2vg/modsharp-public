@@ -164,6 +164,8 @@ static CUtlVector<SchemaClass_t*>          g_SchemaList;
 static SchemaKeyValueMap_t                 g_SchemaMap{};
 static std::unordered_map<uint64_t, void*> g_DataMapInputFuncMap{};
 
+static std::unordered_map<std::string, const SchemaClassInfoData_t*> g_ClassInfoMap{};
+
 struct CNetworkSerializerFieldInfo
 {
     uint32_t   m_nHash;          // 0x00  field name hash
@@ -223,6 +225,9 @@ static_assert(sizeof(CNetworkSerializerCodeGenDatabase) == 0xB0);
 
 // Map: class_name -> set of networked field names
 static std::unordered_map<std::string, std::unordered_set<std::string>> g_NetworkedFieldMap;
+
+// Map: class_name -> schema class size (CNetworkSerializerClassInfo::m_nClassSize)
+static std::unordered_map<std::string, int32_t> g_ClassSizeMap;
 
 static void BuildNetworkedFieldMap()
 {
@@ -308,6 +313,8 @@ static void BuildNetworkedFieldMap()
         const auto& class_name = class_info->m_pszClassName;
         if (class_name.IsEmpty()) continue;
 
+        g_ClassSizeMap[class_name.Get()] = class_info->m_nClassSize;
+
         auto& fieldSet = g_NetworkedFieldMap[class_name.Get()];
         for (auto* fieldInfo : class_info->m_Fields)
         {
@@ -332,6 +339,26 @@ static bool IsFieldNetworked(const char* className, const char* fieldName)
     if (classIt == g_NetworkedFieldMap.end()) return false;
 
     return classIt->second.contains(fieldName);
+}
+
+int32_t schemas::GetClassSize(const char* className)
+{
+    if (const auto it = g_ClassSizeMap.find(className); it != g_ClassSizeMap.end())
+    {
+        return it->second;
+    }
+
+    return 0;
+}
+
+const SchemaClassInfoData_t* schemas::FindClassInfo(const char* className)
+{
+    if (const auto it = g_ClassInfoMap.find(className); it != g_ClassInfoMap.end())
+    {
+        return it->second;
+    }
+
+    return nullptr;
 }
 
 int32_t schemas::FindChainOffset(const char* className)
@@ -430,19 +457,6 @@ static void ProcessDataMapFields(SchemaClass_t*                        derived_s
         const auto* field_name = dataMap_field.fieldName;
         if (field_name == nullptr)
             continue;
-
-        if (dataMap_field.inputFunc != nullptr)
-        {
-            auto new_dm_field  = derived_schema_class->dataMapFields.AddToTailGetPtr();
-            new_dm_field->name = field_name;
-            memcpy(&new_dm_field->inputFunc, &dataMap_field.inputFunc, sizeof(void*));
-
-            char key_buffer[512];
-            snprintf(key_buffer, sizeof(key_buffer), "%s->%s", derived_schema_class->name.Get(), field_name);
-            g_DataMapInputFuncMap[MurmurHash2(key_buffer, MURMURHASH_SEED_MODSHARP)] = new_dm_field->inputFunc;
-
-            continue;
-        }
 
         constexpr int32_t invalid_offset = 0x7fffffff;
         const auto        offset         = dataMap_field.fieldOffset;
@@ -667,6 +681,8 @@ static void ScanSchemaScopeType(CSchemaSystemTypeScope* type_scope)
         {
             continue;
         }
+
+        g_ClassInfoMap.try_emplace(class_info->GetName(), class_info);
 
         auto* schema_class = new SchemaClass_t();
         schema_class->name = class_info->GetName();
