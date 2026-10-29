@@ -68,25 +68,25 @@ static void EngineError(const char* text)
     FatalError("CoreCLR Error: %s", text);
 }
 
-static void RejectConnection(void* pNetInfo, IServerGameClient::ENetworkDisconnectionReason reason)
+static void RejectConnection(uint32_t hNetInfo, IServerGameClient::ENetworkDisconnectionReason reason)
 {
     AssertPtr(g_pNetworkSystem);
-    g_pNetworkSystem->RejectNetChannel(pNetInfo, reason);
+    g_pNetworkSystem->RejectNetChannel(hNetInfo, reason);
 }
 
 static void LogMsg(const char* text)
 {
-    ConsoleMessage("Sharp.Core", text);
+    ConsoleMessage("Sharp.Core", "%s", text);
 }
 
 static void LogWarning(const char* text)
 {
-    ConsoleWarning("Sharp.Core", text);
+    ConsoleWarning("Sharp.Core", "%s", text);
 }
 
 static void ColorText(char r, char g, char b, const char* text)
 {
-    ConsoleText(Color(r, g, b), text);
+    ConsoleText(Color(r, g, b), "%s", text);
 }
 
 static void ChangeLevel(const char* map)
@@ -126,7 +126,7 @@ static bool IsMapValid(const char* map)
 
 static void ServerCommand(const char* command)
 {
-    char buffer[256];
+    char buffer[1024];
     snprintf(buffer, sizeof(buffer), "%s\n", command);
     engine->ServerCommand(buffer);
 }

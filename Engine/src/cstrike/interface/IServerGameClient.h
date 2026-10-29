@@ -154,6 +154,9 @@ public:
         NETWORK_DISCONNECT_KICKED_SUICIDE                        = 159, // "#Player_DisconnectReason_Suicide"
         NETWORK_DISCONNECT_KICKED_NOSTEAMLOGIN                   = 160, // "#Player_DisconnectReason_NoSteamLogin"
         NETWORK_DISCONNECT_KICKED_NOSTEAMTICKET                  = 161, // "#Player_DisconnectReason_NoSteamTicket"
+        NETWORK_DISCONNECT_KICKED_INPUTAUTOMATION                = 162, // "#Player_DisconnectReason_InputAutomation"
+        NETWORK_DISCONNECT_KICKED_VACNETABNORMALBEHAVIOR         = 163, // "#Player_DisconnectReason_VacNetAbnormalBehavior"
+        NETWORK_DISCONNECT_KICKED_INSECURECLIENT                 = 164, // "#Player_DisconnectReason_InsecureClient"
     };
 
 public:
@@ -164,22 +167,20 @@ public:
     virtual void ClientFullyConnect(PlayerSlot_t nSlot)                                                                                                        = 0; // 15
     virtual void ClientDisconnect(PlayerSlot_t nSlot, ENetworkDisconnectionReason reason, const char* pszName, SteamId_t steamId, const char* pszNetworkId)    = 0; // 16
     virtual void ClientCommand(PlayerSlot_t nSlot, const class CCommand& pCommand)                                                                             = 0; // 17
-    virtual void ClientSettingsChanged(PlayerSlot_t nSlot)                                                                                                     = 0; // 18
+    virtual void ClientStringTableChanged(PlayerSlot_t slot, void* pData)                                                                                      = 0; // 18
+    virtual void ClientSettingsChanged(PlayerSlot_t nSlot)                                                                                                     = 0; // 19
 
 private:
-    virtual void Unknown19() = 0;
+    virtual void Unknown20() = 0;
 
 public:
-    virtual float ProcessUserCommands(PlayerSlot_t nSlot, void* buf, int numCommands, bool ignore, bool paused) = 0; // 20
-    virtual bool  IsPlayerControllerExistsBySlot(PlayerSlot_t nSlot)                                            = 0; // 21
-    virtual bool  IsPlayerAlive(PlayerSlot_t nSlot)                                                             = 0; // 22
-    virtual int   GetPlayerScore(PlayerSlot_t nSlot)                                                            = 0; // 23
-    virtual void  GetClientEyePosition(PlayerSlot_t nSlot, class Vector* pEyeOrigin)                            = 0; // 24
-    virtual void  GetBugReportInfo(void* buf)                                                                   = 0; // 25
-    virtual void  ClientVoice(PlayerSlot_t nSlot)                                                               = 0; // 26
-
-    /* Null Sub */
-    virtual void NetworkIDValidated(const char* pszName, const char* pszNetworkId) = 0; // 27
+    virtual float ProcessUserCommands(PlayerSlot_t nSlot, void* buf, bool paused)    = 0; // 21
+    virtual bool  IsPlayerControllerExistsBySlot(PlayerSlot_t nSlot)                 = 0; // 22
+    virtual bool  IsPlayerAlive(PlayerSlot_t nSlot)                                  = 0; // 23
+    virtual int   GetPlayerScore(PlayerSlot_t nSlot)                                 = 0; // 24
+    virtual void  GetClientEyePosition(PlayerSlot_t nSlot, class Vector* pEyeOrigin) = 0; // 25
+    virtual void  GetBugReportInfo(void* buf)                                        = 0; // 26
+    virtual void  ClientVoice(PlayerSlot_t nSlot)                                    = 0; // 27
 
     virtual void ClientCommandKeyValues(PlayerSlot_t nSlot, /* KeyValues*/ void* pKeyValues) = 0; // 28
 
@@ -193,8 +194,9 @@ public:
         eClientFullyConnect, // put in game ( Hltv / Replay 之类的不触发 )
         eClientDisconnect,
         eClientCommand,
+        eClientStringTableChanged,
         eClientSettingsChanged,
-        eUnknown19,
+        eUnknown20,
         eProcessUserCommands,
         eIsPlayerControllerExistsBySlot,
         eIsPlayerAlive,
@@ -202,7 +204,6 @@ public:
         eGetClientEyePosition,
         eGetBugReportInfo,
         eClientVoice,
-        eNetworkIDValidated,
         eClientCommandKeyValues
     };
 };

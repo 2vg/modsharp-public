@@ -182,19 +182,24 @@ static CConVarBaseData* FindConVar(const char* name, bool useIterator)
     return useIterator ? icvar->FindConVarIterator(name) : icvar->GetConVar(icvar->FindConVar(name));
 }
 
-static void SetConVarValue(CConVarBaseData* pConVar, CVValue_t* value)
+static bool SetConVarValue(CConVarBaseData* pConVar, CVValue_t* value)
 {
-    g_ConVarManager.SetValue(pConVar, value);
+    return g_ConVarManager.SetValue(pConVar, value);
 }
 
-static void SetConVarMinBound(CConVarBaseData* pConVar, CVValue_t* value)
+static bool SetConVarValueString(CConVarBaseData* pConVar, const char* value)
 {
-    g_ConVarManager.SetMin(pConVar, value);
+    return g_ConVarManager.SetValueString(pConVar, value);
 }
 
-static void SetConVarMaxBound(CConVarBaseData* pConVar, CVValue_t* value)
+static bool SetConVarMinBound(CConVarBaseData* pConVar, CVValue_t* value)
 {
-    g_ConVarManager.SetMax(pConVar, value);
+    return g_ConVarManager.SetMin(pConVar, value);
+}
+
+static bool SetConVarMaxBound(CConVarBaseData* pConVar, CVValue_t* value)
+{
+    return g_ConVarManager.SetMax(pConVar, value);
 }
 
 static int64_t CreateCommand(const char* name, const char* helpString, int flags)
@@ -206,6 +211,18 @@ static int64_t CreateCommand(const char* name, const char* helpString, int flags
 static bool ReleaseCommand(const char* name)
 {
     return g_ConVarManager.ReleaseCommand(name);
+}
+
+static int64_t FindGameCommandHandle(const char* name)
+{
+    auto handle = g_ConVarManager.FindGameCommandHandle(name);
+    return *reinterpret_cast<int64_t*>(&handle);
+}
+
+static int64_t FindSharpCommandHandle(const char* name)
+{
+    auto handle = g_ConVarManager.FindSharpCommandHandle(name);
+    return *reinterpret_cast<int64_t*>(&handle);
 }
 
 static void ReplicateToClient(const CConVarBaseData* pConVar, const char* pszValue, const CServerSideClient* pClient)
@@ -224,9 +241,12 @@ void Init()
     bridge::CreateNative("Cvar.CreateConVar", reinterpret_cast<void*>(CreateConVar));
     bridge::CreateNative("Cvar.CreateCommand", reinterpret_cast<void*>(CreateCommand));
     bridge::CreateNative("Cvar.SetValue", reinterpret_cast<void*>(SetConVarValue));
+    bridge::CreateNative("Cvar.SetValueString", reinterpret_cast<void*>(SetConVarValueString));
     bridge::CreateNative("Cvar.SetMinBound", reinterpret_cast<void*>(SetConVarMinBound));
     bridge::CreateNative("Cvar.SetMaxBound", reinterpret_cast<void*>(SetConVarMaxBound));
     bridge::CreateNative("Cvar.ReleaseCommand", reinterpret_cast<void*>(ReleaseCommand));
+    bridge::CreateNative("Cvar.FindGameCommandHandle", reinterpret_cast<void*>(FindGameCommandHandle));
+    bridge::CreateNative("Cvar.FindSharpCommandHandle", reinterpret_cast<void*>(FindSharpCommandHandle));
     bridge::CreateNative("Cvar.ReplicateToClient", reinterpret_cast<void*>(ReplicateToClient));
 
     // hook

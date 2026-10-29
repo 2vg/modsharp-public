@@ -17,6 +17,7 @@
  * along with ModSharp. If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "address.h"
 #include "bridge/forwards/forward.h"
 #include "bridge/natives/EntityNatives.h"
 #include "gamedata.h"
@@ -28,7 +29,6 @@
 #include "module.h"
 #include "sdkproxy.h"
 #include "strtool.h"
-#include "vhook/call.h"
 
 #include "cstrike/component/CBodyComponent.h"
 #include "cstrike/component/CGameSceneNode.h"
@@ -59,6 +59,7 @@
 #include <safetyhook.hpp>
 
 #include <algorithm>
+#include <limits>
 
 // #define ENTITY_HOOK_ASSERT
 // #define ENTITY_LISTENER_ASSERT
@@ -77,8 +78,26 @@ static CBaseEntity* s_pInputCallerOverride = nullptr;
 extern void SetPlayerLaggedMovementValue(CCSPlayerController* pController, float flValue);
 extern void SetPlayerRunSpeedValue(CCSPlayerController* pController, float flValue);
 
+static const CEntityClass* LogicCaseClass()
+{
+    static const auto s_pClass = g_pGameEntitySystem->FindEntityClassByName("logic_case");
+    AssertPtr(s_pClass);
+    return s_pClass;
+}
+
+static const CEntityClass* PointHurtClass()
+{
+    static const auto s_pClass = g_pGameEntitySystem->FindEntityClassByName("point_hurt");
+    AssertPtr(s_pClass);
+    return s_pClass;
+}
+
+bool IsPushFixEnabled()
+{
+    return ms_trigger_push_fixes_enabled->GetValue<bool>();
+}
+
 // 这里涉及到安全问题, 所以暂时全局Hook
-// 现在Mapper可以通过该实体传入任意命令!
 BeginMemberHookScope(CPointServerCommand)
 {
     DeclareMemberDetourHook(InputCommand, void, (CBaseEntity * pEntity, const InputData_t* pInput))
@@ -94,7 +113,7 @@ BeginMemberHookScope(CPointServerCommand)
         if (forwards::OnPointServerCommand->Invoke(pEntity, pCommand) == EHookAction::SkipCallReturnOverride)
             return;
 
-        engine->ServerCommand(pCommand);
+        InputCommand(pEntity, pInput);
     }
 }
 
@@ -229,6 +248,14 @@ BeginMemberHookScope(CTriggerPush)
         vecAbsDir.y = pushDir.x * mat[1][0] + pushDir.y * mat[1][1] + pushDir.z * mat[1][2];
         vecAbsDir.z = pushDir.x * mat[2][0] + pushDir.y * mat[2][1] + pushDir.z * mat[2][2];
 
+        if (pEntity->m_bUsePathSimple())
+        {
+            if (address::server::CTriggerPush_PathSimplePushDir == nullptr)
+                return Touch(pEntity, pOther);
+
+            address::server::CTriggerPush_PathSimplePushDir(pEntity, pOther, &vecAbsDir);
+        }
+
         auto vecPush = vecAbsDir * pEntity->m_flSpeed() * ms_trigger_push_scale->GetValue<float>();
         auto flags   = pOther->GetFlags();
 
@@ -259,32 +286,84 @@ BeginMemberHookScope(CTriggerPush)
 // 实现EventIOOutputHook
 BeginMemberHookScope(CEntityIOOutput)
 {
-    DeclareMemberDetourHook(FireOutput, void, (CEntityIOOutput * pIO, CBaseEntity * pActivator, CBaseEntity * pCaller, const Variant_t& value, float flDelay, void* a6, void* a7))
+    DeclareMemberDetourHook(FireOutput, void, (CEntityIOOutput * pIO, CBaseEntity * pActivator, CBaseEntity * pCaller, void* pArgs, float flDelay, KeyValues3* pKeyValues, const Variant_t* pValue))
     {
         if (!pCaller)
-            return FireOutput(pIO, pActivator, pCaller, value, flDelay, a6, a7);
+            return FireOutput(pIO, pActivator, pCaller, pArgs, flDelay, pKeyValues, pValue);
 
         if (natives::entity::OnEntityFireOutput(s_pInputCallerOverride ? s_pInputCallerOverride : pCaller, pIO, pActivator, flDelay) == EHookAction::SkipCallReturnOverride)
             return;
 
-        FireOutput(pIO, pActivator, pCaller, value, flDelay, a6, a7);
+        FireOutput(pIO, pActivator, pCaller, pArgs, flDelay, pKeyValues, pValue);
     }
 }
 
 // 实现劫持AcceptInput
 BeginMemberHookScope(CEntityIdentity)
 {
-    // As of game build 24116939 the trailing void* was dropped: CEntityIdentity::AcceptInput went
-    // from 8 params to 7. a7 is kept only to forward it untouched to the original.
-    DeclareMemberDetourHook(AcceptInput, bool, (CEntityIdentity * pInstance, CUtlSymbolLarge * pInput, CBaseEntity * pActivator, CBaseEntity * pCaller, Variant_t * pValue, void* a6, void* a7))
+    static bool IsPulseFloatIntegerString(const char* pszValue)
     {
-        if (!pInstance || !pInput)
-            return AcceptInput(pInstance, pInput, pActivator, pCaller, pValue, a6, a7);
+        if (*pszValue == '-')
+            pszValue++;
 
-        int nOutputId = 0; // todo: remove
-
-        if (natives::entity::OnEntityAcceptInput(pInstance, pInput->Get(), pActivator, pCaller, pValue, nOutputId) == EHookAction::SkipCallReturnOverride)
+        if (*pszValue == '0')
+            pszValue++;
+        else if (*pszValue >= '1' && *pszValue <= '9')
+            while (*pszValue >= '0' && *pszValue <= '9')
+                pszValue++;
+        else
             return false;
+
+        return strcmp(pszValue, ".0") == 0;
+    }
+
+    // a connection's override parameter lives in pKeyValues under "--old-connection-literal--" and takes precedence over pArgs
+    DeclareMemberDetourHook(AcceptInput, bool, (CEntityIdentity * pInstance, CUtlSymbolLarge * pInput, CBaseEntity * pActivator, CBaseEntity * pCaller, Variant_t * pValue, void* pArgs, KeyValues3* pKeyValues))
+    {
+        static const Variant_t* _pRedispatchValue = nullptr;
+
+        if (!pInstance || !pInput || (_pRedispatchValue && pValue == _pRedispatchValue))
+            return AcceptInput(pInstance, pInput, pActivator, pCaller, pValue, pArgs, pKeyValues);
+
+        if (natives::entity::OnEntityAcceptInput(pInstance, pInput->Get(), pActivator, pCaller, pValue, 0) == EHookAction::SkipCallReturnOverride)
+            return false;
+
+        // Since the 2026-09-23 update float inputs stringify with %f and break logic_case matching, and inputs read args rather than the variant, so re-dispatch through CBaseEntity::AcceptInput to rebuild args
+        if (pValue && pValue->FieldType() == FieldType_t::FIELD_FLOAT32
+            && strcasecmp(pInput->Get(), "InValue") == 0
+            && pInstance->GetEntityClass() == LogicCaseClass())
+        {
+            const auto pCases = pInstance->GetBaseEntity<CLogicCase*>()->m_nCase();
+            if (std::any_of(pCases, pCases + 32, [](const CUtlSymbolLarge& value) { return IsPulseFloatIntegerString(value.Get()); }))
+                return AcceptInput(pInstance, pInput, pActivator, pCaller, pValue, pArgs, pKeyValues);
+
+            class RedispatchValue
+            {
+            public:
+                explicit RedispatchValue(float flValue) :
+                    m_pPrevious(_pRedispatchValue)
+                {
+                    snprintf(m_szValue, sizeof(m_szValue), "%g", static_cast<double>(flValue));
+                    m_Value.SetString(m_szValue);
+                    _pRedispatchValue = &m_Value;
+                }
+                ~RedispatchValue() { _pRedispatchValue = m_pPrevious; }
+
+                RedispatchValue(const RedispatchValue&)            = delete;
+                RedispatchValue& operator=(const RedispatchValue&) = delete;
+
+                [[nodiscard]] Variant_t& Get() { return m_Value; }
+
+            private:
+                char             m_szValue[32];
+                Variant_t        m_Value;
+                const Variant_t* m_pPrevious;
+            };
+
+            // CBaseEntity::AcceptInput re-enters this detour with the same value pointer
+            RedispatchValue value(pValue->Float());
+            return pInstance->GetBaseEntity()->AcceptInput(pInput->Get(), pActivator, pCaller, value.Get());
+        }
 
         if (ms_entity_io_enhancement->GetValue<bool>() && EntityInputEnhancement(pInstance, pInput->Get(), pActivator, pCaller, pValue))
             return true;
@@ -300,9 +379,7 @@ BeginMemberHookScope(CEntityIdentity)
                     if (const auto hActivator = pActivator->GetPublicScriptScope())
                     {
                         ScriptVariant_t activator(hActivator);
-                        CALL_VIRTUAL(bool, 33, g_pScriptVM, pScope, "activator", &activator);
-
-                        // WARN("Fix Activator %p(%s) for %s -> %s", pActivator, pActivator->GetClassname(), pInstance->GetName(), pInput->Get());
+                        g_pScriptVM->SetValue(pScope, "activator", activator);
                     }
                 }
                 if (pCaller)
@@ -310,17 +387,13 @@ BeginMemberHookScope(CEntityIdentity)
                     if (const auto hCaller = pCaller->GetPublicScriptScope())
                     {
                         ScriptVariant_t caller(hCaller);
-                        CALL_VIRTUAL(bool, 33, g_pScriptVM, pScope, "caller", &caller);
-
-                        // WARN("Fix Caller %p(%s) for %s -> %s", pCaller, pCaller->GetClassname(), pInstance->GetName(), pInput->Get());
+                        g_pScriptVM->SetValue(pScope, "caller", caller);
                     }
                 }
             }
-
-            // g_pScriptVM->SetValueVariant(pScope, "caller", &caller);
         }
 
-        return AcceptInput(pInstance, pInput, pActivator, pCaller, pValue, a6, a7);
+        return AcceptInput(pInstance, pInput, pActivator, pCaller, pValue, pArgs, pKeyValues);
     }
 }
 
@@ -1106,7 +1179,10 @@ static void AddOutputCustom_MoveType(const CEntityIdentity* pInstance, const cha
 
 static void AddOutputCustom_EntityTemplate(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, const std::vector<std::string>& vecArgs)
 {
-    if (strcmp(pInstance->GetClassname(), "env_entity_maker") == 0)
+    static const auto s_pEnvEntityMakerClass = g_pGameEntitySystem->FindEntityClassByName("env_entity_maker");
+    AssertPtr(s_pEnvEntityMakerClass);
+
+    if (pInstance->GetEntityClass() == s_pEnvEntityMakerClass)
     {
         const auto pEntity = pInstance->GetBaseEntity<CEnvEntityMaker*>();
 
@@ -1155,11 +1231,11 @@ static void AddOutputCustom_Target(const CEntityIdentity* pInstance, const char*
 
 static void AddOutputCustom_FilterName(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, const std::vector<std::string>& vecArgs)
 {
-    if (strncasecmp(pInstance->GetClassname(), "trigger_", 8) == 0)
+    if (modules::server->IsPointerDerivedFrom(pInstance->GetBaseEntity(), "CBaseTrigger"))
     {
         if (const auto pTarget = g_pGameEntitySystem->FindByName(nullptr, vecArgs[1].c_str()))
         {
-            if (strncasecmp(pTarget->GetClassname(), "filter_", 7) == 0)
+            if (modules::server->IsPointerDerivedFrom(pTarget, "CBaseFilter"))
             {
                 const auto pTrigger = pInstance->GetBaseEntity<CBaseTrigger*>();
                 pTrigger->m_iFilterName(const_cast<char*>(pTarget->GetName()));
@@ -1190,8 +1266,11 @@ static void AddOutputCustom_Force(const CEntityIdentity* pInstance, const char* 
 {
     const auto value = static_cast<float>(atof(vecArgs[1].c_str()));
 
+    static const auto s_pPhysThrusterClass = g_pGameEntitySystem->FindEntityClassByName("phys_thruster");
+    AssertPtr(s_pPhysThrusterClass);
+
     const auto pEntity = pInstance->GetBaseEntity<CPhysThruster*>();
-    if (strcasecmp(pEntity->GetClassname(), "phys_thruster") == 0)
+    if (pInstance->GetEntityClass() == s_pPhysThrusterClass)
     {
         pEntity->m_force(value);
 
@@ -1287,7 +1366,7 @@ static void AddOutputCustom_Damage(const CEntityIdentity* pInstance, const char*
 {
     const auto pEntity = reinterpret_cast<CPointHurt*>(pInstance->GetBaseEntity());
 
-    if (strcasecmp(pEntity->GetClassname(), "point_hurt") == 0)
+    if (pInstance->GetEntityClass() == PointHurtClass())
     {
         // damage max to 99999999 or damage will be broken, idk how the valve work.
         const auto value = std::clamp(atoi(vecArgs[1].c_str()), 0, 99999999);
@@ -1308,9 +1387,9 @@ static void AddOutputCustom_DamageType(const CEntityIdentity* pInstance, const c
 {
     const auto pEntity = reinterpret_cast<CPointHurt*>(pInstance->GetBaseEntity());
 
-    if (strcasecmp(pEntity->GetClassname(), "point_hurt") == 0)
+    if (pInstance->GetEntityClass() == PointHurtClass())
     {
-        const auto value = std::clamp(atoi(vecArgs[1].c_str()), 0, INT_MAX);
+        const auto value = std::clamp(atoi(vecArgs[1].c_str()), 0, std::numeric_limits<int32_t>::max());
         pEntity->m_bitsDamageType(value);
 
         if (ms_entity_io_verbose_logging->GetValue<bool>())
@@ -1328,7 +1407,7 @@ static void AddOutputCustom_DamageRadius(const CEntityIdentity* pInstance, const
 {
     const auto pEntity = reinterpret_cast<CPointHurt*>(pInstance->GetBaseEntity());
 
-    if (strcasecmp(pEntity->GetClassname(), "point_hurt") == 0)
+    if (pInstance->GetEntityClass() == PointHurtClass())
     {
         const auto value = static_cast<float>(atof(vecArgs[1].c_str()));
         pEntity->m_flRadius(value);
@@ -1348,7 +1427,7 @@ static void AddOutputCustom_Case(const CEntityIdentity* pInstance, const char* p
 {
     const auto pEntity = reinterpret_cast<CLogicCase*>(pInstance->GetBaseEntity());
 
-    if (strcasecmp(pEntity->GetClassname(), "logic_case") == 0)
+    if (pInstance->GetEntityClass() == LogicCaseClass())
     {
         if (vecArgs[0].length() != 6)
         {
@@ -1669,20 +1748,22 @@ static bool CustomInput_ModifySpeed(const CEntityIdentity* pInstance, const char
 
 static bool CustomInput_SetMessage(const CEntityIdentity* pInstance, const char* pInput, CBaseEntity* pActivator, CBaseEntity* pCaller, Variant_t* pValue)
 {
+    static const auto s_pEnvHudHintClass = g_pGameEntitySystem->FindEntityClassByName("env_hudhint");
+    AssertPtr(s_pEnvHudHintClass);
+
+    const auto pEntity = reinterpret_cast<CEnvHudHint*>(pInstance->GetBaseEntity());
+
+    if (pInstance->GetEntityClass() != s_pEnvHudHintClass)
+        return false;
+
     if (const auto param = pValue->AutoCastString())
     {
-        const auto pEntity = reinterpret_cast<CEnvHudHint*>(pInstance->GetBaseEntity());
-        if (strcasecmp(pEntity->GetClassname(), "env_hudhint") == 0)
+        const auto& message = g_pGameEntitySystem->AllocPooledString(param);
+        pEntity->m_iszMessage(message);
+
+        if (ms_entity_io_verbose_logging->GetValue<bool>())
         {
-            const auto& message = g_pGameEntitySystem->AllocPooledString(param);
-            pEntity->m_iszMessage(message);
-
-            if (ms_entity_io_verbose_logging->GetValue<bool>())
-            {
-                LOG("Set HudMessage to %s for %s", message.Get(), pInstance->GetName());
-            }
-
-            return true;
+            LOG("Set HudMessage to %s for %s", message.Get(), pInstance->GetName());
         }
     }
     else
@@ -1690,35 +1771,8 @@ static bool CustomInput_SetMessage(const CEntityIdentity* pInstance, const char*
         InputError();
     }
 
-    // probably handle to other entity
-    return false;
+    return true;
 }
-
-struct CaseInsensitiveHash
-{
-    using is_transparent = void;
-    size_t operator()(std::string_view view) const
-    {
-        size_t hash = 0;
-        for (auto c : view)
-            hash = hash * 31 + static_cast<unsigned char>(tolower(c));
-        return hash;
-    }
-};
-
-struct CaseInsensitiveEqual
-{
-    using is_transparent = void;
-    bool operator()(std::string_view a, std::string_view b) const
-    {
-        if (a.size() != b.size())
-            return false;
-        for (size_t i = 0; i < a.size(); ++i)
-            if (tolower(static_cast<unsigned char>(a[i])) != tolower(static_cast<unsigned char>(b[i])))
-                return false;
-        return true;
-    }
-};
 
 static const std::unordered_map<std::string_view, InputEnhancement_t, CaseInsensitiveHash, CaseInsensitiveEqual> s_InputEnhancementInputs = {
     {"CustomAddOutput", CustomInput_CustomAddOutput},

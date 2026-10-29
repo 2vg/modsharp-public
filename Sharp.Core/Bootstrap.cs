@@ -36,6 +36,7 @@ using Sharp.Core.Bridges;
 using Sharp.Core.Bridges.Natives;
 using Sharp.Core.GameObjects;
 using Sharp.Core.Helpers;
+using Sharp.Core.Logging;
 using Sharp.Core.Managers;
 using Sharp.Core.Pools;
 using Sharp.Core.Utilities;
@@ -53,6 +54,10 @@ namespace Sharp.Core;
 public static class Bootstrap
 {
     private static readonly ShutdownMonitor ShutdownMonitor = new ();
+
+    private static LogCaptureSink? _logCapture;
+
+    internal static Serilog.ILogger CoreLogger { get; private set; } = Serilog.Core.Logger.None;
 
 #region Unmanaged Caller
 
@@ -396,6 +401,8 @@ public static class Bootstrap
                 ValidateOnBuild = true, ValidateScopes = true,
             });
 
+            _logCapture?.Arm(serviceProvider.GetRequiredService<ICoreLibraryModuleManager>().Tier0);
+
             ap.Stop();
 
             if (benchmark)
@@ -487,6 +494,11 @@ public static class Bootstrap
             }
         }
 
+        var logCapture = new LogCaptureSink(consoleTemplate);
+        var runtimeLog = new RuntimeLogDispatchSink();
+
+        _logCapture = logCapture;
+
         var loggerConfiguration = new LoggerConfiguration()
                                   .Destructure.ByTransforming<SteamID>(x => x.DestructureTransform())
                                   .Destructure.ByTransforming<EntityIndex>(x => x.AsPrimitive())
@@ -500,6 +512,9 @@ public static class Bootstrap
                                                         .WriteTo.Console(theme: AnsiConsoleTheme.Code,
                                                                          outputTemplate: consoleTemplate,
                                                                          applyThemeToRedirectedOutput: false))
+                                  .WriteTo.Logger(lc => lc
+                                                        .Filter.ByIncludingOnly(e => e.Level >= LogEventLevel.Warning)
+                                                        .WriteTo.Sink(logCapture))
                                   .WriteTo.Logger(lc => lc.Filter
                                                           .ByIncludingOnly(e => e.Level is LogEventLevel.Verbose)
                                                           .WriteTo.Async(a =>
@@ -533,7 +548,8 @@ public static class Bootstrap
                                                         .WriteTo.File(Path.Combine(logsDir, "Error..log"),
                                                                       rollingInterval: RollingInterval.Day,
                                                                       outputTemplate: fileTemplate,
-                                                                      shared: false));
+                                                                      shared: false))
+                                  .WriteTo.Sink(runtimeLog);
 
         if (loggerSettings.GetSection("LogLevel") is { } levels)
         {
@@ -572,7 +588,10 @@ public static class Bootstrap
             logging.AddSerilog(logger, true);
         });
 
-        Log.Logger = logger;
+        services.AddSingleton(runtimeLog);
+
+        CoreLogger = logger;
+        Log.Logger = new NonDisposingLogger(logger);
     }
 
     private static void ConfigureServices(IServiceCollection services, IConfiguration configuration)
@@ -581,6 +600,7 @@ public static class Bootstrap
         services.AddSingleton<IShutdownMonitor>(ShutdownMonitor);
         services.AddSingleton<ExceptionHandler>();
 
+        services.AddSingleton<ICoreAssemblyManager, AssemblyManager>();
         services.AddSingleton<ISharpCore, SharpCore>();
         services.AddSingleton<ICoreLibraryModuleManager, LibraryModuleManager>();
         services.AddSingleton<ICoreClientManager, ClientManager>();
@@ -596,6 +616,10 @@ public static class Bootstrap
         services.AddSingleton<ICorePhysicsQueryManager, PhysicsQueryManager>();
         services.AddSingleton<ICoreSharpModuleManager, SharpModuleManager>();
         services.AddSingleton<ICoreParticleManager, ParticleManager>();
+        services.AddSingleton<ICoreAddonManager, AddonManager>();
+        services.AddSingleton<ICoreScriptManager, ScriptManager>();
+        services.AddSingleton<ICorePanoramaManager, PanoramaManager>();
+        services.AddSingleton<ICoreLoggingManager, LoggingManager>();
         services.AddSingleton<ISharedManager, SharedManager>();
     }
 
@@ -615,6 +639,10 @@ public static class Bootstrap
         services.GetRequiredService<ICorePhysicsQueryManager>();
         services.GetRequiredService<ICoreSharpModuleManager>();
         services.GetRequiredService<ICoreParticleManager>();
+        services.GetRequiredService<ICoreAddonManager>();
+        services.GetRequiredService<ICoreScriptManager>();
+        services.GetRequiredService<ICorePanoramaManager>();
+        services.GetRequiredService<ICoreLoggingManager>();
 
         services.GetRequiredService<ExceptionHandler>().Start();
         services.GetRequiredService<ISharpCore>().InitMainThread();

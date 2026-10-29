@@ -26,7 +26,6 @@
 #include "netmessage.h"
 #include "sdkproxy.h"
 
-#include "CoreCLR/NativeSpan.h"
 #include "CoreCLR/RuntimeProtobufMessage.h"
 #include "CoreCLR/RuntimeRecipientFilter.h"
 
@@ -41,8 +40,8 @@
 #include "cstrike/type/CTrace.h"
 #include "cstrike/type/ResourceSystem.h"
 
-extern void DualMountAddonOverrideClientCheck(SteamId_t steamId, double time);
-extern void DualMountAddonPurgeClientCheck();
+#include "manager/AddonManager.h"
+
 
 namespace google::protobuf
 {
@@ -59,11 +58,17 @@ static void PrecacheResource(IResourceManifest* pContext, const char* pszResourc
 
 static void PrintChannelAll(HudPrint_t dest, const char* message)
 {
+    if (!sv)
+        return;
+
     sv->PrintChannelAll(dest, message);
 }
 
 static void PrintChannelTeam(HudPrint_t dest, CStrikeTeam_t team, const char* message)
 {
+    if (!sv)
+        return;
+
     sv->PrintChannelTeam(dest, team, message);
 }
 
@@ -99,8 +104,6 @@ static void TerminateRound(float delay, uint32_t reason, bool bypassHook, TeamRe
     gameRules->TerminateRound(delay, reason, bypassHook, info, size);
 }
 
-// HACK 这里因为返回值问题可能导致C#传参问题
-static CTraceResult_t g_TraceResult = {};
 class CTraceFilterCustom : public CTraceFilter
 {
 public:
@@ -240,17 +243,32 @@ static void* GetMapGroupMapList(const char* mapGroup)
     return g_pGameTypes->GetMapGroupMapList(mapGroup);
 }
 
-static NativeSpan<uint8_t> FindResourceDataBlockInfo(const char* filePath, const char* pathId)
+static thread_local std::vector<uint8_t> s_resourceDataBlock;
+
+static int FindResourceDataBlockInfo(const char* filePath, const char* pathId)
 {
+    std::vector<uint8_t>().swap(s_resourceDataBlock);
+
     const auto buffer = ReadGameFile(filePath, pathId);
-    if (buffer.empty())
-        return NativeSpan<uint8_t>{nullptr, 0};
 
     CResourceBlockInfo output{};
-    if (Resource_FindBlockInfo(reinterpret_cast<const ResourceFileHeader_t*>(buffer.data()), g_ResourceBlockId_Data, output))
-        return NativeSpan{reinterpret_cast<uint8_t*>(output.m_pBlockData), output.m_nSize};
+    if (!Resource_FindBlockInfo(buffer.data(), buffer.size(), g_ResourceBlockId_Data, output) || output.m_nSize <= 0)
+        return 0;
 
-    return NativeSpan<uint8_t>{nullptr, 0};
+    const auto pBlock = reinterpret_cast<const uint8_t*>(output.m_pBlockData);
+    s_resourceDataBlock.assign(pBlock, pBlock + output.m_nSize);
+
+    return output.m_nSize;
+}
+
+static void CopyResourceDataBlock(uint8_t* pOutput, int size)
+{
+    AssertPtr(pOutput);
+    AssertBool(size == static_cast<int>(s_resourceDataBlock.size()));
+
+    memcpy(pOutput, s_resourceDataBlock.data(), size);
+
+    std::vector<uint8_t>().swap(s_resourceDataBlock);
 }
 
 static ResourceStatus_t GetResourceStatus(const char* fileName)
@@ -264,13 +282,17 @@ static ResourceStatus_t GetResourceStatus(const char* fileName)
 
 static const char* GetAddonName()
 {
-    AssertPtr(sv);
+    if (!sv)
+        return nullptr;
+
     return sv->GetAddonName();
 }
 
 static const char* GetMapName()
 {
-    AssertPtr(sv);
+    if (!sv)
+        return nullptr;
+
     return sv->GetMapName();
 }
 
@@ -284,14 +306,45 @@ static CCSWeaponBaseVData* FindWeaponVDataByName(const char* name)
     return address::server::FindWeaponVDataByName(1, name);
 }
 
-static void DualAddonPurgeCheck()
+static NativeSpan<uint64_t> AddonGetAddons()
 {
-    ::DualMountAddonPurgeClientCheck();
+    const auto& addons = g_AddonManager.GetAddons();
+    return NativeSpan(const_cast<uint64_t*>(addons.data()), static_cast<int>(addons.size()));
 }
 
-static void DualAddonOverrideCheck(SteamId_t steamId, double time)
+static void AddonSetAddons(const uint64_t* pAddons, int count)
 {
-    ::DualMountAddonOverrideClientCheck(steamId, time);
+    g_AddonManager.SetAddons(std::vector(pAddons, pAddons + count));
+}
+
+static void AddonResetClientCache(SteamId_t steamId)
+{
+    g_AddonManager.ResetClientCache(steamId);
+}
+
+static bool AddonRefreshClient(SteamId_t steamId, bool resetCache)
+{
+    return g_AddonManager.RefreshClient(steamId, resetCache);
+}
+
+static bool AddonUpdateAddon(uint64_t fileId, bool reloadMap)
+{
+    return g_AddonManager.UpdateAddon(fileId, reloadMap);
+}
+
+static void AddonReloadMap()
+{
+    g_AddonManager.ReloadMap();
+}
+
+static void AddonSetOptions(float clientTimeout, float connectionTimeout, float cacheDuration, bool debug)
+{
+    g_AddonManager.SetOptions(clientTimeout, connectionTimeout, cacheDuration, debug);
+}
+
+static void AddonSetClientQueryEnabled(bool enabled)
+{
+    g_AddonManager.SetClientQueryEnabled(enabled);
 }
 
 static bool AddWorkshopMap(uint64_t sharedFileId, const char* mapName, const char* path)
@@ -342,6 +395,7 @@ void Init()
     bridge::CreateNative("Game.GetMapGroupMapList", reinterpret_cast<void*>(GetMapGroupMapList));
 
     bridge::CreateNative("Game.FindResourceDataBlockInfo", reinterpret_cast<void*>(FindResourceDataBlockInfo));
+    bridge::CreateNative("Game.CopyResourceDataBlock", reinterpret_cast<void*>(CopyResourceDataBlock));
     bridge::CreateNative("Game.GetResourceStatus", reinterpret_cast<void*>(GetResourceStatus));
 
     bridge::CreateNative("Game.GetAddonName", reinterpret_cast<void*>(GetAddonName));
@@ -351,8 +405,14 @@ void Init()
 
     bridge::CreateNative("Game.GetGameSystemFactory", reinterpret_cast<void*>(GetGameSystemFactory));
 
-    bridge::CreateNative("Game.DualAddonPurgeCheck", reinterpret_cast<void*>(DualAddonPurgeCheck));
-    bridge::CreateNative("Game.DualAddonOverrideCheck", reinterpret_cast<void*>(DualAddonOverrideCheck));
+    bridge::CreateNative("Game.AddonGetAddons", reinterpret_cast<void*>(AddonGetAddons));
+    bridge::CreateNative("Game.AddonSetAddons", reinterpret_cast<void*>(AddonSetAddons));
+    bridge::CreateNative("Game.AddonResetClientCache", reinterpret_cast<void*>(AddonResetClientCache));
+    bridge::CreateNative("Game.AddonRefreshClient", reinterpret_cast<void*>(AddonRefreshClient));
+    bridge::CreateNative("Game.AddonUpdateAddon", reinterpret_cast<void*>(AddonUpdateAddon));
+    bridge::CreateNative("Game.AddonReloadMap", reinterpret_cast<void*>(AddonReloadMap));
+    bridge::CreateNative("Game.AddonSetOptions", reinterpret_cast<void*>(AddonSetOptions));
+    bridge::CreateNative("Game.AddonSetClientQueryEnabled", reinterpret_cast<void*>(AddonSetClientQueryEnabled));
 
     bridge::CreateNative("Game.AddWorkshopMap", reinterpret_cast<void*>(AddWorkshopMap));
     bridge::CreateNative("Game.WorkshopMapExists", reinterpret_cast<void*>(WorkshopMapExists));

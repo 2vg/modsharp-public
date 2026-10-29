@@ -1,4 +1,4 @@
-/* 
+/*
  * ModSharp
  * Copyright (C) 2023-2026 Kxnrl. All Rights Reserved.
  *
@@ -17,14 +17,25 @@
  * along with ModSharp. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "cstrike/interface/INetChannel.h"
+using System.Runtime.InteropServices;
+using Sharp.Shared.Utilities;
 
-#include "gamedata.h"
-#include "global.h"
+namespace Sharp.Core.Bridges.Forwards;
 
-void INetChannel::SendNetMessage(INetworkSerializable* pSerializable, google::protobuf::Message* pMessage, int reliable)
+internal static class Panorama
 {
-    using fn          = void (*)(INetChannel*, INetworkSerializable*, google::protobuf::Message*, int);
-    static auto pCall = g_pGameData->GetAddress<fn>("INetChannel::SendNetMessage");
-    pCall(this, pSerializable, pMessage, reliable);
+    public delegate void DelegateOnCustomHudLayoutClicked(nint player, nint layout, string buttonId);
+
+    public static event DelegateOnCustomHudLayoutClicked? OnCustomHudLayoutClicked;
+
+    [UnmanagedCallersOnly]
+    public static unsafe void OnCustomHudLayoutClickedExport(nint player, nint layout, sbyte* pButtonId)
+    {
+        if (OnCustomHudLayoutClicked is null || player == nint.Zero || layout == nint.Zero || pButtonId == null)
+        {
+            return;
+        }
+
+        OnCustomHudLayoutClicked.Invoke(player, layout, Utils.ReadString(pButtonId));
+    }
 }

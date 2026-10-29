@@ -37,6 +37,7 @@ using Sharp.Core.Bridges;
 using Sharp.Core.Bridges.Interfaces;
 using Sharp.Core.Bridges.Natives;
 using Sharp.Core.Helpers;
+using Sharp.Core.Managers;
 using Sharp.Core.Objects;
 using Sharp.Shared;
 using Sharp.Shared.CStrike;
@@ -56,7 +57,13 @@ internal interface ISharpCore : IModSharp
 {
     void InitMainThread();
 
+    bool IsOnMainThread();
+
     void OnModuleUnload(IModSharpModule module);
+
+    void OnModuleUnloaded(IModSharpModule module);
+
+    void OnModuleLoadFailure(Assembly assembly);
 }
 
 // ReSharper disable ForCanBeConvertedToForeach
@@ -68,19 +75,24 @@ internal partial class SharpCore : ISharpCore
 
     private record GameSimulateHookInfo(Action Callback, int Priority);
 
-    private readonly ILogger<SharpCore> _logger;
+    private readonly ILogger<SharpCore>   _logger;
+    private readonly ICoreAssemblyManager _assemblyManager;
 
-    private readonly List<IGameListener>                       _gameListeners;
-    private readonly List<ISteamListener>                      _steamListeners;
-    private readonly List<GameFrameHookInfo>                   _framePreHooks;
-    private readonly List<GameFrameHookInfo>                   _framePostHooks;
-    private readonly List<EntityThinkHookInfo>                 _entityPreHooks;
-    private readonly List<EntityThinkHookInfo>                 _entityPostHooks;
-    private readonly List<GameSimulateHookInfo>                _gameSimulateHooks;
+    private readonly SubscriberList<IGameListener>             _gameListeners;
+    private readonly SubscriberList<ISteamListener>            _steamListeners;
+    private readonly SubscriberList<GameFrameHookInfo>         _framePreHooks;
+    private readonly SubscriberList<GameFrameHookInfo>         _framePostHooks;
+    private readonly SubscriberList<EntityThinkHookInfo>       _entityPreHooks;
+    private readonly SubscriberList<EntityThinkHookInfo>       _entityPostHooks;
+    private readonly SubscriberList<GameSimulateHookInfo>      _gameSimulateHooks;
     private readonly ConcurrentQueue<AssemblyAction>           _actionQueue;
+    private readonly ConcurrentQueue<AssemblyTimer>            _stoppedTimers;
     private readonly ConcurrentDictionary<Guid, AssemblyTimer> _timers;
-    private readonly string                                    _gamePath;
+    private readonly ICoreScriptManager                        _scriptManager;
     private readonly FrozenDictionary<string, string?>         _commandLines;
+
+    private readonly string _gamePath;
+    private readonly int    _bootThreadId;
 
     private int          _mainThreadId;
     private IDisposable? _logContext;
@@ -92,24 +104,28 @@ internal partial class SharpCore : ISharpCore
     private GlobalVars?    _globalVars;
     private GameRules?     _gameRules;
 
-    public SharpCore(ILogger<SharpCore> logger, IShutdownMonitor shutdownMonitor)
+    public SharpCore(ILogger<SharpCore> logger, IShutdownMonitor shutdownMonitor, ICoreAssemblyManager assemblyManager, ICoreScriptManager scriptManager)
     {
-        _logger = logger;
+        _logger          = logger;
+        _assemblyManager = assemblyManager;
+        _scriptManager   = scriptManager;
 
         shutdownMonitor.RegisterShutdownEvent(Shutdown);
 
-        _gameListeners     = [];
-        _steamListeners    = [];
-        _framePreHooks     = [];
-        _framePostHooks    = [];
-        _entityPreHooks    = [];
-        _entityPostHooks   = [];
-        _gameSimulateHooks = [];
+        _gameListeners     = new SubscriberList<IGameListener>(x => x.ListenerPriority);
+        _steamListeners    = new SubscriberList<ISteamListener>(x => x.ListenerPriority);
+        _framePreHooks     = new SubscriberList<GameFrameHookInfo>(x => x.Priority);
+        _framePostHooks    = new SubscriberList<GameFrameHookInfo>(x => x.Priority);
+        _entityPreHooks    = new SubscriberList<EntityThinkHookInfo>(x => x.Priority);
+        _entityPostHooks   = new SubscriberList<EntityThinkHookInfo>(x => x.Priority);
+        _gameSimulateHooks = new SubscriberList<GameSimulateHookInfo>(null);
         _actionQueue       = [];
+        _stoppedTimers     = [];
         _timers            = [];
 
         _precacheContext = nint.Zero;
         _commandLines    = ParseCommandLine();
+        _bootThreadId    = Environment.CurrentManagedThreadId;
 
         _lastFrameCalled = 0;
         _totalFrameTime  = 0;
@@ -145,6 +161,8 @@ internal partial class SharpCore : ISharpCore
         Bridges.Forwards.Steam.OnDownloadItemResult         += OnDownloadItemResult;
         Bridges.Forwards.Steam.OnItemInstalled              += OnItemInstalled;
 
+        _assemblyManager.RegisterUnloadCleanup(ClearLeakedRegistrations);
+
         CenterHtmlHelper.InitDelegates();
     }
 
@@ -158,54 +176,54 @@ internal partial class SharpCore : ISharpCore
         _logContext?.Dispose();
         _logContext = LogContext.PushProperty("MapName", $"| {GetMapName() ?? "<empty>"}");
 
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnServerInit();
+                listener.OnServerInit();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnServerInit),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
 
     private void OnServerSpawn()
     {
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnServerSpawn();
+                listener.OnServerSpawn();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnServerSpawn),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
 
     private void OnServerActivate()
     {
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnServerActivate();
+                listener.OnServerActivate();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnServerActivate),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
@@ -214,46 +232,46 @@ internal partial class SharpCore : ISharpCore
     {
         _gameRules = GameRules.Create(Bridges.Natives.Core.GetGameRules());
 
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnGameInit();
+                listener.OnGameInit();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnGameInit),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
 
     private void OnGameShutdown()
     {
-        ClearMapTimer();
-
         _gameRules?.MarkAsDisposed();
         _gameRules = null;
 
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnGameShutdown();
+                listener.OnGameShutdown();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnGameShutdown),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
 
         _sv?.MarkAsDisposed();
         _globalVars?.MarkAsDisposed();
+
+        ClearLeakedMapTimers();
 
         _logContext?.Dispose();
         _logContext = null;
@@ -264,36 +282,36 @@ internal partial class SharpCore : ISharpCore
 
     private void OnGamePostInit()
     {
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnGamePostInit();
+                listener.OnGamePostInit();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnGamePostInit),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
 
     private void OnGamePreShutdown()
     {
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnGamePreShutdown();
+                listener.OnGamePreShutdown();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnGamePreShutdown),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
 
@@ -302,58 +320,56 @@ internal partial class SharpCore : ISharpCore
 
     private void OnGameActivate()
     {
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnGameActivate();
+                listener.OnGameActivate();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnGameActivate),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
 
     private void OnGameDeactivate()
     {
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnGameDeactivate();
+                listener.OnGameDeactivate();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnGameDeactivate),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
-
-        ClearMapTimer();
     }
 
     private void OnResourcePrecache(nint pContext)
     {
         _precacheContext = pContext;
 
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnResourcePrecache();
+                listener.OnResourcePrecache();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnResourcePrecache),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
 
@@ -362,6 +378,8 @@ internal partial class SharpCore : ISharpCore
 
     private void OnRoundRestart()
     {
+        RunStoppedTimers();
+
         // Stop timer only current round
         {
             var timers = _timers.Where(x => x.Value.Flags.HasFlag(GameTimerFlags.StopOnRoundEnd))
@@ -372,50 +390,47 @@ internal partial class SharpCore : ISharpCore
             {
                 var x = timers[i];
 
-                if (_timers.Remove(x, out var timer) && timer.Flags.HasFlag(GameTimerFlags.ForceCallOnStop))
+                if (_timers.TryRemove(x, out var timer) && timer.Flags.HasFlag(GameTimerFlags.ForceCallOnStop))
                 {
-                    try
-                    {
-                        timer.ForceRun();
-                    }
-                    catch (Exception e)
-                    {
-                        _logger.LogWarning(e, "An error occurred while timer removed with flag {f}", timer.Flags);
-                    }
+                    ForceRunOnStop(timer);
                 }
             }
+
+            RunStoppedTimers();
         }
 
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnRoundRestart();
+                listener.OnRoundRestart();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnRoundRestart),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
+
+        ClearLeakedRoundTimers();
     }
 
     private void OnRoundRestarted()
     {
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                _gameListeners[i].OnRoundRestarted();
+                listener.OnRoundRestarted();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnRoundRestarted),
-                                 _gameListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
@@ -424,11 +439,11 @@ internal partial class SharpCore : ISharpCore
     {
         var action = ECommandAction.Skipped;
 
-        for (var i = 0; i < _gameListeners.Count; i++)
+        foreach (var listener in _gameListeners)
         {
             try
             {
-                var low = _gameListeners[i].ConsoleSay(message);
+                var low = listener.ConsoleSay(message);
 
                 if (low > action)
                 {
@@ -451,11 +466,11 @@ internal partial class SharpCore : ISharpCore
             return;
         }
 
-        for (var i = 0; i < _entityPreHooks.Count; i++)
+        foreach (var hook in _entityPreHooks)
         {
             try
             {
-                _entityPreHooks[i].Callback();
+                hook.Callback();
             }
             catch (Exception e)
             {
@@ -473,11 +488,11 @@ internal partial class SharpCore : ISharpCore
             return;
         }
 
-        for (var i = 0; i < _entityPostHooks.Count; i++)
+        foreach (var hook in _entityPostHooks)
         {
             try
             {
-                _entityPostHooks[i].Callback();
+                hook.Callback();
             }
             catch (Exception e)
             {
@@ -495,11 +510,11 @@ internal partial class SharpCore : ISharpCore
             return;
         }
 
-        for (var i = 0; i < _gameSimulateHooks.Count; i++)
+        foreach (var hook in _gameSimulateHooks)
         {
             try
             {
-                _gameSimulateHooks[i].Callback();
+                hook.Callback();
             }
             catch (Exception e)
             {
@@ -510,22 +525,6 @@ internal partial class SharpCore : ISharpCore
 
     private void OnGameFramePre(bool simulating, bool firstTick, bool lastTick)
     {
-        if (_framePreHooks.Count > 0)
-        {
-            for (var i = 0; i < _framePreHooks.Count; i++)
-            {
-                try
-                {
-                    _framePreHooks[i].Callback(simulating, firstTick, lastTick);
-                }
-                catch (Exception e)
-                {
-                    _logger.LogError(e, "An error occurred while calling hook callback {name}", nameof(OnGameFramePre));
-                }
-            }
-        }
-
-        // if game does not run frame
         if (simulating)
         {
             var globalVars = GetGlobals();
@@ -541,45 +540,76 @@ internal partial class SharpCore : ISharpCore
             }
 
             _lastFrameCalled = frameTime;
+        }
 
-            if (!_timers.IsEmpty)
+        if (_framePreHooks.Count > 0)
+        {
+            foreach (var hook in _framePreHooks)
             {
-                var timers = _timers.Values.ToArray();
-
-                for (var i = 0; i < timers.Length; i++)
+                try
                 {
-                    var timer  = timers[i];
-                    var remove = false;
+                    hook.Callback(simulating, firstTick, lastTick);
+                }
+                catch (Exception e)
+                {
+                    _logger.LogError(e, "An error occurred while calling hook callback {name}", nameof(OnGameFramePre));
+                }
+            }
+        }
 
-                    try
-                    {
-                        if (!timer.IsInitialized)
-                        {
-                            timer.Initialize(_totalFrameTime);
-                        }
+        // if game does not run frame
+        if (!simulating || _timers.IsEmpty)
+        {
+            return;
+        }
 
-                        if (!timer.RunThink(_totalFrameTime))
-                        {
-                            continue;
-                        }
+        var timers = _timers.Values.ToArray();
 
-                        if (!timer.Flags.HasFlag(GameTimerFlags.Repeatable))
-                        {
-                            remove = true;
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        remove = true;
-                        _logger.LogError(e, "An error occurred while timer elapsed.");
-                    }
-                    finally
-                    {
-                        if (remove)
-                        {
-                            _timers.Remove(timer.UniqueId, out _);
-                        }
-                    }
+        for (var i = 0; i < timers.Length; i++)
+        {
+            var timer = timers[i];
+
+            if (!_timers.ContainsKey(timer.UniqueId))
+            {
+                continue;
+            }
+
+            if (_assemblyManager.IsDelegateUnloaded(timer.Callback))
+            {
+                _timers.TryRemove(timer.UniqueId, out _);
+
+                continue;
+            }
+
+            var remove = false;
+
+            try
+            {
+                if (!timer.IsInitialized)
+                {
+                    timer.Initialize(_totalFrameTime);
+                }
+
+                if (!timer.RunThink(_totalFrameTime))
+                {
+                    continue;
+                }
+
+                if (!timer.Flags.HasFlag(GameTimerFlags.Repeatable))
+                {
+                    remove = true;
+                }
+            }
+            catch (Exception e)
+            {
+                remove = true;
+                _logger.LogError(e, "An error occurred while timer elapsed.");
+            }
+            finally
+            {
+                if (remove)
+                {
+                    _timers.TryRemove(timer.UniqueId, out _);
                 }
             }
         }
@@ -589,11 +619,11 @@ internal partial class SharpCore : ISharpCore
     {
         if (_framePostHooks.Count > 0)
         {
-            for (var i = 0; i < _framePostHooks.Count; i++)
+            foreach (var hook in _framePostHooks)
             {
                 try
                 {
-                    _framePostHooks[i].Callback(simulating, firstTick, lastTick);
+                    hook.Callback(simulating, firstTick, lastTick);
                 }
                 catch (Exception e)
                 {
@@ -608,8 +638,17 @@ internal partial class SharpCore : ISharpCore
             return;
         }
 
+        RunStoppedTimers();
+
         while (_actionQueue.TryDequeue(out var action))
         {
+            if (_assemblyManager.IsDelegateUnloaded(action.Owner))
+            {
+                DiscardAction(action.OnDiscard);
+
+                continue;
+            }
+
             try
             {
                 action.Action.Invoke();
@@ -627,108 +666,108 @@ internal partial class SharpCore : ISharpCore
 
     private void OnGroupStatusResult(SteamID steamId, SteamID groupId, bool member, bool officer)
     {
-        for (var i = 0; i < _steamListeners.Count; i++)
+        foreach (var listener in _steamListeners)
         {
             try
             {
-                _steamListeners[i].OnGroupStatusResult(steamId, groupId, member, officer);
+                listener.OnGroupStatusResult(steamId, groupId, member, officer);
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnGroupStatusResult),
-                                 _steamListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
 
     private void OnSteamServersConnected()
     {
-        for (var i = 0; i < _steamListeners.Count; i++)
+        foreach (var listener in _steamListeners)
         {
             try
             {
-                _steamListeners[i].OnSteamServersConnected();
+                listener.OnSteamServersConnected();
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnSteamServersConnected),
-                                 _steamListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
 
     private void OnSteamServersDisconnected(SteamApiResult reason)
     {
-        for (var i = 0; i < _steamListeners.Count; i++)
+        foreach (var listener in _steamListeners)
         {
             try
             {
-                _steamListeners[i].OnSteamServersDisconnected(reason);
+                listener.OnSteamServersDisconnected(reason);
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnSteamServersDisconnected),
-                                 _steamListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
 
     private void OnSteamServersConnectFailure(SteamApiResult reason, bool stillRetrying)
     {
-        for (var i = 0; i < _steamListeners.Count; i++)
+        foreach (var listener in _steamListeners)
         {
             try
             {
-                _steamListeners[i].OnSteamServersConnectFailure(reason, stillRetrying);
+                listener.OnSteamServersConnectFailure(reason, stillRetrying);
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnSteamServersConnectFailure),
-                                 _steamListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
 
     private void OnDownloadItemResult(ulong sharedFileId, SteamApiResult result)
     {
-        for (var i = 0; i < _steamListeners.Count; i++)
+        foreach (var listener in _steamListeners)
         {
             try
             {
-                _steamListeners[i].OnDownloadItemResult(sharedFileId, result);
+                listener.OnDownloadItemResult(sharedFileId, result);
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnDownloadItemResult),
-                                 _steamListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
 
     private void OnItemInstalled(ulong sharedFileId)
     {
-        for (var i = 0; i < _steamListeners.Count; i++)
+        foreach (var listener in _steamListeners)
         {
             try
             {
-                _steamListeners[i].OnItemInstalled(sharedFileId);
+                listener.OnItemInstalled(sharedFileId);
             }
             catch (Exception e)
             {
                 _logger.LogError(e,
                                  "An error occurred while calling listener<{s}> {name}",
                                  nameof(OnItemInstalled),
-                                 _steamListeners[i].GetType().Name);
+                                 listener.GetType().Name);
             }
         }
     }
@@ -756,15 +795,19 @@ internal partial class SharpCore : ISharpCore
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var source   = new TaskCompletionSource<T>();
-        var assembly = action.Method.Module.Assembly;
+        if (!action.HasSingleTarget)
+        {
+            throw new ArgumentException("Multicast delegates are not supported, register each callback separately",
+                                        nameof(action));
+        }
 
-        EnqueueAction(assembly,
-                      () =>
+        var source = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        EnqueueAction(() =>
                       {
                           if (cancellationToken.IsCancellationRequested)
                           {
-                              source.SetCanceled(CancellationToken.None);
+                              source.SetCanceled(cancellationToken);
 
                               return;
                           }
@@ -778,7 +821,9 @@ internal partial class SharpCore : ISharpCore
                           {
                               source.SetException(e);
                           }
-                      });
+                      },
+                      action,
+                      () => source.TrySetCanceled());
 
         return source.Task;
     }
@@ -787,15 +832,19 @@ internal partial class SharpCore : ISharpCore
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var source   = new TaskCompletionSource();
-        var assembly = action.Method.Module.Assembly;
+        if (!action.HasSingleTarget)
+        {
+            throw new ArgumentException("Multicast delegates are not supported, register each callback separately",
+                                        nameof(action));
+        }
 
-        EnqueueAction(assembly,
-                      () =>
+        var source = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        EnqueueAction(() =>
                       {
                           if (cancellationToken.IsCancellationRequested)
                           {
-                              source.SetCanceled(CancellationToken.None);
+                              source.SetCanceled(cancellationToken);
 
                               return;
                           }
@@ -809,18 +858,45 @@ internal partial class SharpCore : ISharpCore
                           {
                               source.SetException(e);
                           }
-                      });
+                      },
+                      action,
+                      () => source.TrySetCanceled());
 
         return source.Task;
     }
 
     public Guid PushTimer(Action action, double interval, GameTimerFlags flags = GameTimerFlags.None)
     {
-        var timer = new AssemblyActionTimer(action.Method.Module.Assembly, interval, flags, action);
+        if (!action.HasSingleTarget)
+        {
+            throw new ArgumentException("Multicast delegates are not supported, register each callback separately",
+                                        nameof(action));
+        }
+
+        if (_assemblyManager.IsDelegateUnloaded(action))
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return Guid.Empty;
+        }
+
+        var timer = new AssemblyActionTimer(interval, flags, action);
+
+        if (Environment.CurrentManagedThreadId == _mainThreadId)
+        {
+            timer.Initialize(_totalFrameTime);
+        }
 
         if (!_timers.TryAdd(timer.UniqueId, timer))
         {
             throw new InvalidOperationException($"Could not push timer {timer.UniqueId}");
+        }
+
+        if (_assemblyManager.IsDelegateUnloaded(action))
+        {
+            _timers.TryRemove(timer.UniqueId, out _);
+
+            return Guid.Empty;
         }
 
         return timer.UniqueId;
@@ -828,11 +904,36 @@ internal partial class SharpCore : ISharpCore
 
     public Guid PushTimer(Func<TimerAction> action, double interval, GameTimerFlags flags = GameTimerFlags.None)
     {
-        var timer = new AssemblyFunctionTimer(action.Method.Module.Assembly, interval, flags, action);
+        if (!action.HasSingleTarget)
+        {
+            throw new ArgumentException("Multicast delegates are not supported, register each callback separately",
+                                        nameof(action));
+        }
+
+        if (_assemblyManager.IsDelegateUnloaded(action))
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return Guid.Empty;
+        }
+
+        var timer = new AssemblyFunctionTimer(interval, flags, action);
+
+        if (Environment.CurrentManagedThreadId == _mainThreadId)
+        {
+            timer.Initialize(_totalFrameTime);
+        }
 
         if (!_timers.TryAdd(timer.UniqueId, timer))
         {
             throw new InvalidOperationException($"Could not push timer {timer.UniqueId}");
+        }
+
+        if (_assemblyManager.IsDelegateUnloaded(action))
+        {
+            _timers.TryRemove(timer.UniqueId, out _);
+
+            return Guid.Empty;
         }
 
         return timer.UniqueId;
@@ -840,16 +941,26 @@ internal partial class SharpCore : ISharpCore
 
     public void StopTimer(Guid uniqueId)
     {
-        if (_timers.Remove(uniqueId, out var timer) && timer.Flags.HasFlag(GameTimerFlags.ForceCallOnStop))
+        if (!IsOnMainThread())
         {
-            try
+            if (!_timers.TryGetValue(uniqueId, out var stopping))
             {
-                timer.ForceRun();
+                return;
             }
-            catch (Exception e)
+
+            if (stopping.Flags.HasFlag(GameTimerFlags.ForceCallOnStop))
             {
-                _logger.LogWarning(e, "An error occurred while timer removed with flag {f}", timer.Flags);
+                _stoppedTimers.Enqueue(stopping);
             }
+
+            _timers.TryRemove(uniqueId, out _);
+
+            return;
+        }
+
+        if (_timers.TryRemove(uniqueId, out var timer) && timer.Flags.HasFlag(GameTimerFlags.ForceCallOnStop))
+        {
+            ForceRunOnStop(timer);
         }
     }
 
@@ -926,13 +1037,26 @@ internal partial class SharpCore : ISharpCore
         {
             if (NativeString.CStringCmp(factory->m_pszName.Value, pName) == 0)
             {
-                return GameSystem.Create(factory->m_pInstance);
+                return GameSystem.Create(GetGameSystemInstance(factory));
             }
 
             factory = factory->m_pNext;
         }
 
         return null;
+    }
+
+    private static unsafe nint GetGameSystemInstance(CGameSystemFactory* factory)
+    {
+        var index          = CoreGameData.Core.GetVFuncIndex("IGameSystemFactory::IsReallocating");
+        var isReallocating = ((delegate* unmanaged<CGameSystemFactory*, byte>) (*(nint**) factory)[index])(factory) != 0;
+
+        if (!isReallocating)
+        {
+            return factory->m_pInstance;
+        }
+
+        return factory->m_pInstance == nint.Zero ? nint.Zero : *(nint*) factory->m_pInstance;
     }
 
     public IntPtr FindValveInterface(string module, string name)
@@ -943,6 +1067,9 @@ internal partial class SharpCore : ISharpCore
 
     public IntPtr FindPattern(string module, string pattern)
         => Bridges.Natives.Core.FindPattern(module, pattern);
+
+    public nint GetEntityClassThinkFunc(string classname, string thinkName)
+        => Bridges.Natives.Entity.GetThinkFunc(classname, thinkName);
 
     public IntPtr GetVTableByClass(string module, string className)
         => Bridges.Natives.Core.GetVTableByClass(module, className);
@@ -1020,16 +1147,28 @@ internal partial class SharpCore : ISharpCore
         return items;
     }
 
-    public byte[]? FindResourceDataBlockInfo(string filePath, string pathId)
+    public unsafe byte[]? FindResourceDataBlockInfo(string filePath, string pathId)
     {
         if (!filePath.EndsWith("_c"))
         {
             filePath += "_c";
         }
 
-        var span = Game.FindResourceDataBlockInfo(filePath, pathId);
+        var size = Game.FindResourceDataBlockInfo(filePath, pathId);
 
-        return span.Length == 0 ? null : span.AsSpan().ToArray();
+        if (size <= 0)
+        {
+            return null;
+        }
+
+        var data = new byte[size];
+
+        fixed (byte* pData = data)
+        {
+            Game.CopyResourceDataBlock(pData, size);
+        }
+
+        return data;
     }
 
     public ResourceStatus GetResourceStatus(string filePath)
@@ -1116,12 +1255,19 @@ internal partial class SharpCore : ISharpCore
 
     public void InstallGameListener(IGameListener listener)
     {
+        if (_assemblyManager.IsAssemblyUnloaded(listener.GetType().Assembly))
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
         if (listener.ListenerVersion != IGameListener.ApiVersion)
         {
             throw new InvalidOperationException("Your listener api version mismatch");
         }
 
-        if (_gameListeners.Any(x => x.Equals(listener)))
+        if (_gameListeners.Exists(x => x.Equals(listener)))
         {
             _logger.LogError("You are already install listener!\n{stackTrace}", Environment.StackTrace);
 
@@ -1129,7 +1275,6 @@ internal partial class SharpCore : ISharpCore
         }
 
         _gameListeners.Add(listener);
-        _gameListeners.Sort((x, y) => y.ListenerPriority.CompareTo(x.ListenerPriority));
     }
 
     public void RemoveGameListener(IGameListener listener)
@@ -1142,12 +1287,19 @@ internal partial class SharpCore : ISharpCore
 
     public void InstallSteamListener(ISteamListener listener)
     {
+        if (_assemblyManager.IsAssemblyUnloaded(listener.GetType().Assembly))
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
         if (listener.ListenerVersion != ISteamListener.ApiVersion)
         {
             throw new InvalidOperationException("Your listener api version mismatch");
         }
 
-        if (_steamListeners.Any(x => x.Equals(listener)))
+        if (_steamListeners.Exists(x => x.Equals(listener)))
         {
             _logger.LogError("You are already install listener!\n{stackTrace}", Environment.StackTrace);
 
@@ -1155,7 +1307,6 @@ internal partial class SharpCore : ISharpCore
         }
 
         _steamListeners.Add(listener);
-        _steamListeners.Sort((x, y) => y.ListenerPriority.CompareTo(x.ListenerPriority));
     }
 
     public void RemoveSteamListener(ISteamListener listener)
@@ -1188,12 +1339,28 @@ internal partial class SharpCore : ISharpCore
         int                                                    prePriority  = 0,
         int                                                    postPriority = 0)
     {
+        if ((pre is not null && !pre.HasSingleTarget) || (post is not null && !post.HasSingleTarget))
+        {
+            _logger.LogError("Multicast delegates are not supported, install each callback separately!\n{stackTrace}",
+                             Environment.StackTrace);
+
+            return;
+        }
+
+        if ((pre is not null && _assemblyManager.IsDelegateUnloaded(pre))
+            || (post is not null && _assemblyManager.IsDelegateUnloaded(post)))
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
         GameFrameHookInfo? preHook  = null;
         GameFrameHookInfo? postHook = null;
 
         if (pre is not null)
         {
-            if (_framePreHooks.Any(x => x.Callback.Equals(pre)))
+            if (_framePreHooks.Exists(x => x.Callback.Equals(pre)))
             {
                 _logger.LogError("You are already installed this hook<pre>!\n{stackTrace}", Environment.StackTrace);
 
@@ -1205,7 +1372,7 @@ internal partial class SharpCore : ISharpCore
 
         if (post is not null)
         {
-            if (_framePostHooks.Any(x => x.Callback.Equals(post)))
+            if (_framePostHooks.Exists(x => x.Callback.Equals(post)))
             {
                 _logger.LogError("You are already installed this hook<post>!\n{stackTrace}", Environment.StackTrace);
 
@@ -1218,24 +1385,38 @@ internal partial class SharpCore : ISharpCore
         if (preHook is not null)
         {
             _framePreHooks.Add(preHook);
-            _framePreHooks.Sort((x, y) => y.Priority.CompareTo(x.Priority));
         }
 
         if (postHook is not null)
         {
             _framePostHooks.Add(postHook);
-            _framePostHooks.Sort((x, y) => y.Priority.CompareTo(x.Priority));
         }
     }
 
     public void InstallEntityThinkHook(Action? pre, Action? post, int prePriority = 0, int postPriority = 0)
     {
+        if ((pre is not null && !pre.HasSingleTarget) || (post is not null && !post.HasSingleTarget))
+        {
+            _logger.LogError("Multicast delegates are not supported, install each callback separately!\n{stackTrace}",
+                             Environment.StackTrace);
+
+            return;
+        }
+
+        if ((pre is not null && _assemblyManager.IsDelegateUnloaded(pre))
+            || (post is not null && _assemblyManager.IsDelegateUnloaded(post)))
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
         EntityThinkHookInfo? preHook  = null;
         EntityThinkHookInfo? postHook = null;
 
         if (pre is not null)
         {
-            if (_entityPreHooks.Any(x => x.Callback.Equals(pre)))
+            if (_entityPreHooks.Exists(x => x.Callback.Equals(pre)))
             {
                 _logger.LogError("You are already installed this hook<pre>!\n{stackTrace}", Environment.StackTrace);
 
@@ -1247,7 +1428,7 @@ internal partial class SharpCore : ISharpCore
 
         if (post is not null)
         {
-            if (_entityPostHooks.Any(x => x.Callback.Equals(post)))
+            if (_entityPostHooks.Exists(x => x.Callback.Equals(post)))
             {
                 _logger.LogError("You are already installed this hook<post>!\n{stackTrace}", Environment.StackTrace);
 
@@ -1260,26 +1441,43 @@ internal partial class SharpCore : ISharpCore
         if (preHook is not null)
         {
             _entityPreHooks.Add(preHook);
-            _entityPreHooks.Sort((x, y) => y.Priority.CompareTo(x.Priority));
         }
 
         if (postHook is not null)
         {
             _entityPostHooks.Add(postHook);
-            _entityPostHooks.Sort((x, y) => y.Priority.CompareTo(x.Priority));
         }
     }
 
     public void InstallServerGameSimulateHook(Action callback, int priority = 0)
     {
-        if (_gameSimulateHooks.Any(x => x.Callback.Equals(callback)))
+        if (!callback.HasSingleTarget)
+        {
+            _logger.LogError("Multicast delegates are not supported, install each callback separately!\n{stackTrace}",
+                             Environment.StackTrace);
+
+            return;
+        }
+
+        if (_assemblyManager.IsDelegateUnloaded(callback))
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
+        if (_gameSimulateHooks.Exists(x => x.Callback.Equals(callback)))
         {
             _logger.LogError("You are already installed this hook<post>!\n{stackTrace}", Environment.StackTrace);
 
             return;
         }
 
-        _gameSimulateHooks.Add(new GameSimulateHookInfo(callback, priority));
+        _gameSimulateHooks.Edit(x =>
+        {
+            var index = x.FindIndex(y => y.Priority < priority);
+            x.Insert(index < 0 ? x.Count : index, new GameSimulateHookInfo(callback, priority));
+        });
     }
 
     public void RemoveGameFrameHook(Action<bool, bool, bool>? pre, Action<bool, bool, bool>? post)
@@ -1370,15 +1568,16 @@ internal partial class SharpCore : ISharpCore
     {
         var arguments = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
 
-        var parts = Bridges.Natives.Core.GetCommandLine().Split(" ").Skip(1).ToArray();
+        var commandLine = Marshal.PtrToStringAnsi(Bridges.Natives.Core.GetCommandLine()) ?? string.Empty;
+        var parts       = SplitCommandLine(commandLine).Skip(1).ToArray();
 
-        for (var i = 1; i < parts.Length; i++)
+        for (var i = 0; i < parts.Length; i++)
         {
             var key = parts[i].Trim();
 
             if (i + 1 >= parts.Length)
             {
-                arguments[key] = null;
+                SetCommandLineArgument(arguments, key, null);
 
                 continue;
             }
@@ -1386,14 +1585,14 @@ internal partial class SharpCore : ISharpCore
             var next = parts[i + 1];
 
             // 下一行是新的命令
-            if (next[0] == '+' || next[0] == '-')
+            if (next.Length > 0 && (next[0] == '+' || next[0] == '-'))
             {
-                arguments[key] = null;
+                SetCommandLineArgument(arguments, key, null);
 
                 continue;
             }
 
-            arguments[key] = next.Trim();
+            SetCommandLineArgument(arguments, key, next.Trim());
             i++;
         }
 
@@ -1409,15 +1608,69 @@ internal partial class SharpCore : ISharpCore
         return arguments.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
     }
 
-#endregion
+    // - 参数与 tier0 ParamValue 一致取首次出现 (sub_18005ED10 @ tier0.dll 20261015)
+    private static void SetCommandLineArgument(Dictionary<string, string?> arguments, string key, string? value)
+    {
+        if (key.StartsWith('-'))
+        {
+            arguments.TryAdd(key, value);
+        }
+        else
+        {
+            arguments[key] = value;
+        }
+    }
 
-#region Dual Addon
+    // 与 tier0 CCommandLine 的切分一致 (sub_18005E930 @ tier0.dll 20261015): GetCmdLine 返回其切分后重拼的串, 无转义
+    private static List<string> SplitCommandLine(string commandLine)
+    {
+        var results = new List<string>();
+        var span    = commandLine.AsSpan();
+        var len     = span.Length;
+        var i       = 0;
 
-    public void DualAddonPurgeCheck()
-        => Game.DualAddonPurgeCheck();
+        while (i < len)
+        {
+            while (i < len && IsCommandLineSpace(span[i]))
+            {
+                i++;
+            }
 
-    public void DualAddonOverrideCheck(SteamID steamId, double time)
-        => Game.DualAddonOverrideCheck(steamId, time);
+            if (i >= len)
+            {
+                break;
+            }
+
+            if (span[i] == '"')
+            {
+                var quoteStart = ++i;
+
+                while (i < len && span[i] != '"')
+                {
+                    i++;
+                }
+
+                results.Add(span[quoteStart..i].ToString());
+                i++;
+
+                continue;
+            }
+
+            var start = i;
+
+            while (i < len && !IsCommandLineSpace(span[i]))
+            {
+                i++;
+            }
+
+            results.Add(span[start..i].ToString());
+        }
+
+        return results;
+    }
+
+    private static bool IsCommandLineSpace(char c)
+        => c is ' ' or >= '\t' and <= '\r';
 
 #endregion
 
@@ -1452,12 +1705,21 @@ internal partial class SharpCore : ISharpCore
     public void InitMainThread()
         => _mainThreadId = Environment.CurrentManagedThreadId;
 
+    public bool IsOnMainThread()
+        => Environment.CurrentManagedThreadId == (_mainThreadId != 0 ? _mainThreadId : _bootThreadId);
+
     private void Shutdown()
     {
         _logger.LogInformation("Shutdown SharpCore");
 
+        RunStoppedTimers();
+        DiscardQueuedActions();
+
         if (_timers.IsEmpty)
         {
+            RunStoppedTimers();
+            DiscardQueuedActions();
+
             return;
         }
 
@@ -1469,12 +1731,17 @@ internal partial class SharpCore : ISharpCore
             {
                 var x = timers[i];
 
+                if (_assemblyManager.IsDelegateUnloaded(x.Callback))
+                {
+                    continue;
+                }
+
                 if (!x.IsInitialized)
                 {
                     x.Initialize(1.0);
                 }
 
-                if (x.Flags.HasFlag(GameTimerFlags.ForceCallBeforeShutdown))
+                if (x.Flags.HasFlag(GameTimerFlags.ForceCallBeforeShutdown) && x.TryFinish())
                 {
                     x.ForceRun();
                 }
@@ -1486,106 +1753,217 @@ internal partial class SharpCore : ISharpCore
         }
 
         _timers.Clear();
+
+        RunStoppedTimers();
+        DiscardQueuedActions();
     }
 
     public void OnModuleUnload(IModSharpModule module)
     {
+        RunStoppedTimers();
+
         var assembly = module.GetType().Assembly;
 
-        ClearAssemblyTimer(assembly);
-        ClearAssemblyAction(assembly);
+        _assemblyManager.MarkAssemblyUnloaded(assembly);
+        ClearUnloadedTimers(assembly);
+        _scriptManager.OnModuleUnload(assembly);
+    }
+
+    public void OnModuleUnloaded(IModSharpModule module)
+        => _assemblyManager.InvokeUnloadCleanup();
+
+    public void OnModuleLoadFailure(Assembly assembly)
+    {
+        _assemblyManager.MarkAssemblyUnloaded(assembly);
+        ClearUnloadedTimers(null);
+        _assemblyManager.InvokeUnloadCleanup();
+    }
+
+    private void ClearLeakedRegistrations()
+    {
+        _gameListeners.Edit(x => _assemblyManager.ClearLeakedListeners(x, "GameListener"));
+        _steamListeners.Edit(x => _assemblyManager.ClearLeakedListeners(x, "SteamListener"));
+
+        _framePreHooks.Edit(x => _assemblyManager.ClearLeakedCallbacks(x, "GameFramePreHook", y => y.Callback));
+        _framePostHooks.Edit(x => _assemblyManager.ClearLeakedCallbacks(x, "GameFramePostHook", y => y.Callback));
+        _entityPreHooks.Edit(x => _assemblyManager.ClearLeakedCallbacks(x, "EntityThinkPreHook", y => y.Callback));
+        _entityPostHooks.Edit(x => _assemblyManager.ClearLeakedCallbacks(x, "EntityThinkPostHook", y => y.Callback));
+        _gameSimulateHooks.Edit(x => _assemblyManager.ClearLeakedCallbacks(x, "ServerGameSimulateHook", y => y.Callback));
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void EnqueueAction(Action action)
     {
-        var assembly = action.Method.Module.Assembly;
-        EnqueueAction(assembly, action);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void EnqueueAction(Assembly assembly, Action action)
-        => _actionQueue.Enqueue(new AssemblyAction(assembly, action));
-
-    private void ClearMapTimer()
-    {
-        // Stop timer only current map
-
-        var timers = _timers.Where(x => x.Value.Flags.HasFlag(GameTimerFlags.StopOnMapEnd))
-                            .Select(x => x.Key)
-                            .ToArray();
-
-        for (var i = 0; i < timers.Length; i++)
+        if (action.HasSingleTarget)
         {
-            if (_timers.Remove(timers[i], out var timer) && timer.Flags.HasFlag(GameTimerFlags.ForceCallOnStop))
-            {
-                try
-                {
-                    timer.ForceRun();
-                }
-                catch (Exception e)
-                {
-                    _logger.LogWarning(e, "An error occurred while timer removed with flag {f}", timer.Flags);
-                }
-            }
-        }
-    }
+            _actionQueue.Enqueue(new AssemblyAction(action, action));
 
-    private void ClearAssemblyTimer(Assembly assembly)
-    {
-        var timers = _timers.Where(x => x.Value.Assembly.Equals(assembly))
-                            .Select(x => x.Key)
-                            .ToArray();
-
-        for (var i = 0; i < timers.Length; i++)
-        {
-            if (_timers.Remove(timers[i], out var timer) && timer.Flags.HasFlag(GameTimerFlags.ForceCallBeforeShutdown))
-            {
-                try
-                {
-                    timer.ForceRun();
-                }
-                catch (Exception e)
-                {
-                    _logger.LogWarning(e, "An error occurred while timer removed with flag {f}", timer.Flags);
-                }
-            }
-        }
-    }
-
-    private void ClearAssemblyAction(Assembly assembly)
-    {
-        if (_actionQueue.Count == 0)
-        {
             return;
         }
 
-        var backup = new List<AssemblyAction>(_actionQueue.Count);
-
-        while (_actionQueue.TryDequeue(out var item))
+        foreach (var callback in action.GetInvocationList())
         {
-            if (item.Assembly.Equals(assembly))
+            var single = (Action) callback;
+
+            _actionQueue.Enqueue(new AssemblyAction(single, single));
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnqueueAction(Action action, Delegate owner, Action? onDiscard)
+        => _actionQueue.Enqueue(new AssemblyAction(action, owner, onDiscard));
+
+    private void ClearMapTimer()
+    {
+        RunStoppedTimers();
+
+        // Stop timer only current map
+
+        var timers = _timers.Where(x => x.Value.Flags.HasFlag(GameTimerFlags.StopOnMapEnd)
+                                        || x.Value.Flags.HasFlag(GameTimerFlags.StopOnRoundEnd))
+                            .Select(x => x.Key)
+                            .ToArray();
+
+        for (var i = 0; i < timers.Length; i++)
+        {
+            if (_timers.TryRemove(timers[i], out var timer) && timer.Flags.HasFlag(GameTimerFlags.ForceCallOnStop))
+            {
+                ForceRunOnStop(timer);
+            }
+        }
+
+        RunStoppedTimers();
+    }
+
+    private void ClearLeakedMapTimers()
+    {
+        var timers = _timers.Where(x => x.Value.Flags.HasFlag(GameTimerFlags.StopOnMapEnd)
+                                        || x.Value.Flags.HasFlag(GameTimerFlags.StopOnRoundEnd))
+                            .Select(x => x.Key)
+                            .ToArray();
+
+        for (var i = 0; i < timers.Length; i++)
+        {
+            if (_timers.TryRemove(timers[i], out var timer))
+            {
+                timer.TryFinish();
+
+                _logger.LogWarning(
+                    "Map timer pushed after map cleanup, removed at game shutdown without running: {detail} ({flags})",
+                    timer.Callback.GetMethodSignature(),
+                    timer.Flags);
+            }
+        }
+    }
+
+    private void ClearLeakedRoundTimers()
+    {
+        var timers = _timers.Where(x => x.Value.Flags.HasFlag(GameTimerFlags.StopOnRoundEnd))
+                            .Select(x => x.Key)
+                            .ToArray();
+
+        for (var i = 0; i < timers.Length; i++)
+        {
+            if (_timers.TryRemove(timers[i], out var timer))
+            {
+                timer.TryFinish();
+
+                _logger.LogWarning(
+                    "Round timer pushed after round cleanup, removed at round restart without running: {detail} ({flags})",
+                    timer.Callback.GetMethodSignature(),
+                    timer.Flags);
+            }
+        }
+    }
+
+    private void ClearUnloadedTimers(Assembly? forceRunAnchor)
+    {
+        var timers = _timers.Where(x => _assemblyManager.IsDelegateUnloaded(x.Value.Callback))
+                            .Select(x => x.Key)
+                            .ToArray();
+
+        for (var i = 0; i < timers.Length; i++)
+        {
+            if (!_timers.TryRemove(timers[i], out var timer))
             {
                 continue;
             }
 
-            backup.Add(item);
-        }
+            if (forceRunAnchor is null
+                || !timer.Flags.HasFlag(GameTimerFlags.ForceCallBeforeShutdown)
+                || !_assemblyManager.IsDelegateOwnedBy(timer.Callback, forceRunAnchor))
+            {
+                continue;
+            }
 
-        if (backup.Count == 0)
+            try
+            {
+                timer.ForceRun();
+            }
+            catch (Exception e)
+            {
+                _logger.LogWarning(e, "An error occurred while timer removed with flag {f}", timer.Flags);
+            }
+        }
+    }
+
+    private void ForceRunOnStop(AssemblyTimer timer)
+    {
+        if (!timer.TryFinish())
         {
             return;
         }
 
-        foreach (var item in backup)
+        try
         {
-            _actionQueue.Enqueue(item);
+            timer.ForceRun();
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning(e, "An error occurred while timer removed with flag {f}", timer.Flags);
         }
     }
 
-    private readonly record struct AssemblyAction(Assembly Assembly, Action Action);
+    private void RunStoppedTimers()
+    {
+        while (_stoppedTimers.TryDequeue(out var timer))
+        {
+            _timers.TryRemove(timer.UniqueId, out _);
+
+            if (!_assemblyManager.IsDelegateUnloaded(timer.Callback))
+            {
+                ForceRunOnStop(timer);
+            }
+        }
+    }
+
+    private void DiscardQueuedActions()
+    {
+        while (_actionQueue.TryDequeue(out var action))
+        {
+            DiscardAction(action.OnDiscard);
+        }
+    }
+
+    private void DiscardAction(Action? onDiscard)
+    {
+        if (onDiscard is null)
+        {
+            return;
+        }
+
+        try
+        {
+            onDiscard.Invoke();
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "An error occurred while discarding frame action");
+        }
+    }
+
+    private readonly record struct AssemblyAction(Action Action, Delegate Owner, Action? OnDiscard = null);
 
     [StructLayout(LayoutKind.Explicit, Size = 16)]
     private readonly unsafe struct WorkshopMap

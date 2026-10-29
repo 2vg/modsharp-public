@@ -153,21 +153,42 @@ public interface IConVarManager
     ///         please use <see cref="IClientManager.InstallCommandCallback" />
     ///     </remarks>
     /// </summary>
+    /// <remarks>
+    ///     The callback's return value does not affect command execution.
+    ///     Commands with the same name share one engine command: its flags are the union of all registrations,
+    ///     and its help text comes from the first one
+    /// </remarks>
     void CreateConsoleCommand(string                      name,
         Func<IGameClient?, StringCommand, ECommandAction> fn,
         string?                                           description = null,
         ConVarFlags?                                      flags       = null);
 
     /// <summary>
-    ///     Create a server only command
+    ///     Create a server only command, which only responds to non-client callers such as the server console
     /// </summary>
+    /// <remarks>
+    ///     The callback's return value does not affect command execution.
+    ///     Commands with the same name share one engine command: its flags are the union of all registrations,
+    ///     and its help text comes from the first one
+    /// </remarks>
     void CreateServerCommand(string         name,
         Func<StringCommand, ECommandAction> fn,
         string?                             description = null,
         ConVarFlags?                        flags       = null);
 
     /// <summary>
-    ///     Must be called during unload, otherwise leak occurs
+    ///     Deprecated no-op. The engine command is released automatically once its callbacks drain.
     /// </summary>
+    [Obsolete("Use ReleaseConsoleCommandCallback/ReleaseServerCommandCallback; the engine command is released once its callbacks drain.")]
     bool ReleaseCommand(string name);
+
+    /// <summary>
+    ///     Release a previously registered console command callback; the engine command is released once all its callbacks drain
+    /// </summary>
+    void ReleaseConsoleCommandCallback(string name, Func<IGameClient?, StringCommand, ECommandAction> fn);
+
+    /// <summary>
+    ///     Release a previously registered server command callback; the engine command is released once all its callbacks drain
+    /// </summary>
+    void ReleaseServerCommandCallback(string name, Func<StringCommand, ECommandAction> fn);
 }

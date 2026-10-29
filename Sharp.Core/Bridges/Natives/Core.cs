@@ -18,13 +18,16 @@
  */
 
 using System;
+using Sharp.Core.Attributes;
 using Sharp.Shared.Enums;
 
 namespace Sharp.Core.Bridges.Natives;
 
 public static unsafe partial class Core
 {
-    public static partial string GetCommandLine();
+    private const int LogTextMaxBytes = 1920;
+
+    public static partial nint GetCommandLine();
 
     public static partial IntPtr GetCoreBridge();
 
@@ -40,11 +43,11 @@ public static unsafe partial class Core
 
     public static partial void FatalError(string message);
 
-    public static partial void LogWarning(string message);
+    public static partial void LogWarning([NativeUtf8String(LogTextMaxBytes)] string message);
 
-    public static partial void LogMessage(string message);
+    public static partial void LogMessage([NativeUtf8String(LogTextMaxBytes)] string message);
 
-    public static partial void LogColorText(byte r, byte g, byte b, string message);
+    public static partial void LogColorText(byte r, byte g, byte b, [NativeUtf8String(LogTextMaxBytes)] string message);
 
     public static partial nint GetGameData();
 
@@ -70,7 +73,7 @@ public static unsafe partial class Core
 
     public static partial bool SetMemoryAccess(nint address, long size, MemoryAccess access, MemoryAccess* originalAccess);
 
-    public static partial void RejectConnection(nint pNetAdr, NetworkDisconnectionReason reason);
+    public static partial void RejectConnection(uint hNetInfo, NetworkDisconnectionReason reason);
 
     public static partial uint MakeStringToken(string str);
 }

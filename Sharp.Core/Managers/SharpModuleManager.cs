@@ -28,7 +28,6 @@ using System.Text;
 using McMaster.NETCore.Plugins;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Serilog;
 using Sharp.Core.Bridges.Interfaces;
 using Sharp.Core.Helpers;
 using Sharp.Core.Objects;
@@ -58,6 +57,7 @@ internal class SharpModuleManager : ICoreSharpModuleManager
     private readonly List<ModSharpModule>              _modules;
     private readonly Dictionary<string, SharpLibrary>  _libraries;
     private readonly Dictionary<string, DynamicNative> _natives;
+    private readonly long[]                            _lastModulesPrintTick;
 
     public SharpModuleManager(ILogger<SharpModuleManager> logger,
         IShutdownMonitor                                  shutdownMonitor,
@@ -70,9 +70,10 @@ internal class SharpModuleManager : ICoreSharpModuleManager
         _sharedManager = sharedManager;
         _configuration = configuration;
 
-        _modules   = [];
-        _libraries = new Dictionary<string, SharpLibrary>(StringComparer.OrdinalIgnoreCase);
-        _natives   = new Dictionary<string, DynamicNative>(StringComparer.OrdinalIgnoreCase);
+        _modules              = [];
+        _libraries            = new Dictionary<string, SharpLibrary>(StringComparer.OrdinalIgnoreCase);
+        _natives              = new Dictionary<string, DynamicNative>(StringComparer.OrdinalIgnoreCase);
+        _lastModulesPrintTick = new long[64];
 
         Bridges.Forwards.Game.OnStartupServerPre       += OnStartupServer;
         Bridges.Forwards.Core.OnModSharpModulesCommand += OnModSharpModulesCommand;
@@ -84,12 +85,27 @@ internal class SharpModuleManager : ICoreSharpModuleManager
     {
         foreach (var module in _modules)
         {
-            module.ShutdownMutex();
+            try
+            {
+                module.ShutdownMutex();
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Failed to shutdown mutex of module [{name}]", module.Name);
+                Bridges.Natives.Core.FatalError($"Failed to shutdown mutex of module [{module.Name}]");
+            }
         }
 
         foreach (var module in _modules)
         {
-            module.Unload(OnModuleUnload);
+            try
+            {
+                module.Unload(OnModuleUnload);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "Failed to unload module [{name}]", module.Name);
+            }
         }
     }
 
@@ -106,22 +122,29 @@ internal class SharpModuleManager : ICoreSharpModuleManager
                     continue;
                 }
 
-                Log.Logger.Information("Reloading module [{Name}]...", module.Name);
+                Bootstrap.CoreLogger.Warning("Reloading module [{Name}]...", module.Name);
                 module.Unload(OnModuleUnload);
                 module.Update();
                 module.Load(true, OnModuleLoad, _sharedManager, _configuration);
                 updates.Add(module);
-                Log.Logger.Information("Module [{Name}] reloaded successfully", module.Name);
+                Bootstrap.CoreLogger.Warning("Module [{Name}] reloaded successfully", module.Name);
             }
             catch (Exception e)
             {
-                Log.Logger.Error(e, "Failed to reload module [{Name}]", module.Name);
+                Bootstrap.CoreLogger.Error(e, "Failed to reload module [{Name}]", module.Name);
             }
         }
 
-        if (updates.Count > 0)
+        foreach (var module in updates)
         {
-            updates.ForEach(x => x.CallOnAllLoad());
+            try
+            {
+                module.CallOnAllLoad();
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "An error occurred while calling OnAllModulesLoaded of module [{name}]", module.Name);
+            }
         }
 
         if (_modules.Count(x => x.State == ModuleLoadState.Running) == 0)
@@ -132,61 +155,114 @@ internal class SharpModuleManager : ICoreSharpModuleManager
 
     private void OnModSharpModulesCommand(GameClient? client)
     {
-        var builder = new StringBuilder();
-
-        builder.Append("  ModSharp Modules:\n");
-
-        var result = 0;
-
-        for (var i = 0; i < _modules.Count; i++)
+        // server
+        if (client is null)
         {
-            var index   = i + 1;
-            var module  = _modules[i];
-            var version = module.DisplayVersion;
+            var builder = new StringBuilder();
 
-            if (client is null)
+            builder.Append("  ModSharp Modules:\n");
+
+            var total = 0;
+
+            for (var i = 0; i < _modules.Count; i++)
             {
-                builder.Append($"    #{index,-2} {module.Name}\n");
+                var module  = _modules[i];
+                var version = module.DisplayVersion;
 
-                builder.Append($"      module : {module.DisplayName}\n");
+                builder.Append($"    #{i + 1,-2} {module.Name}\n");
+
+                builder.Append($"      module : {GetDisplayName(module)}\n");
                 builder.Append($"      version: {version.Major}.{version.Minor}.{version.Build}\n");
 
-                if (module.DisplayAuthor is { } author)
+                if (GetDisplayAuthor(module) is { } author)
                 {
                     builder.Append($"      author : {author}\n");
                 }
 
                 builder.Append($"      state  : {module.State.ToString()}\n");
-                result++;
+                total++;
             }
-            else if (module.State is ModuleLoadState.Running)
+
+            if (total == 0)
             {
-                builder.Append($"    #{index,-2} {module.DisplayName}");
-                builder.Append($" ({version.Major}.{version.Minor}.{version.Build})");
-
-                if (module.DisplayAuthor is { } author)
-                {
-                    builder.Append($" by {author}");
-                }
-
-                builder.Append('\n');
-                result++;
+                builder.Append("    No modules found.\n");
             }
-        }
 
-        if (result == 0)
-        {
-            builder.Append("    No modules found.\n");
-        }
-
-        if (client is null)
-        {
             Console.WriteLine(builder.ToString());
+
+            return;
         }
-        else
+
+        // anti spam
+        const long modulesCommandCooldownMs = 5000;
+
+        var slot = client.Slot.AsPrimitive();
+        var now  = Environment.TickCount64;
+
+        if (now - _lastModulesPrintTick[slot] < modulesCommandCooldownMs)
         {
-            var receiver = new RecipientFilter(client.Slot);
-            NetMessageHelper.PrintChannelFilter(receiver, HudPrintChannel.Console, builder.ToString());
+            return;
+        }
+
+        _lastModulesPrintTick[slot] = now;
+
+        var receiver = new RecipientFilter(client.Slot);
+
+        NetMessageHelper.PrintChannelFilter(receiver, HudPrintChannel.Console, "  ModSharp Modules:\n");
+
+        var shown = 0;
+
+        for (var i = 0; i < _modules.Count; i++)
+        {
+            var module = _modules[i];
+
+            if (module.State is not ModuleLoadState.Running)
+            {
+                continue;
+            }
+
+            var name    = GetDisplayName(module);
+            var version = module.DisplayVersion;
+            var author  = GetDisplayAuthor(module) is { } a ? $" by {a}" : string.Empty;
+
+            NetMessageHelper.PrintChannelFilter(receiver,
+                                                HudPrintChannel.Console,
+                                                $"    #{shown + 1,-2} {name} ({version.Major}.{version.Minor}.{version.Build}){author}\n");
+
+            shown++;
+        }
+
+        if (shown == 0)
+        {
+            NetMessageHelper.PrintChannelFilter(receiver, HudPrintChannel.Console, "    No modules found.\n");
+        }
+    }
+
+    private string GetDisplayName(ModSharpModule module)
+    {
+        try
+        {
+            return module.DisplayName;
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "Failed to read DisplayName of module [{name}]", module.Name);
+
+            return module.Name;
+        }
+    }
+
+    private string? GetDisplayAuthor(ModSharpModule module)
+    {
+        try
+        {
+            return module.DisplayAuthor;
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "Failed to read DisplayAuthor of module [{name}]", module.Name);
+
+            return null;
         }
     }
 

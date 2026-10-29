@@ -18,14 +18,14 @@
  */
 
 using System;
-using System.Collections.Generic;
-using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 using Sharp.Core.Bridges.Interfaces;
 using Sharp.Core.CStrike;
 using Sharp.Core.GameEntities;
 using Sharp.Core.GameObjects;
+using Sharp.Core.Helpers;
 using Sharp.Core.Managers.Forwards;
 using Sharp.Core.Managers.Hooks;
 using Sharp.Core.Objects;
@@ -38,6 +38,7 @@ using Sharp.Shared.Managers;
 using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
 using Sharp.Shared.Units;
+using Sharp.Shared.Utilities;
 
 // ReSharper disable ArrangeObjectCreationWhenTypeNotEvident
 
@@ -64,7 +65,8 @@ internal interface ICoreHookType<in TParams, THookReturn> where TParams : class,
     bool IsHookInvokeRequired(bool isPost);
 }
 
-internal abstract class HookType<TParams, THookReturn, TClass> : ICoreHookType<TParams, THookReturn>,
+internal abstract class HookType<TParams, THookReturn, TClass> : UnloadCleanupObject,
+    ICoreHookType<TParams, THookReturn>,
     IHookType<TParams, THookReturn>
     where TParams : class, IFunctionParams
     where TClass : HookType<TParams, THookReturn, TClass>
@@ -75,18 +77,19 @@ internal abstract class HookType<TParams, THookReturn, TClass> : ICoreHookType<T
 
     private record PostHookInfo(Action<TParams, HookReturnValue<THookReturn>> Callback, int Priority);
 
-    private readonly List<PreHookInfo>  _preHooks;
-    private readonly List<PostHookInfo> _postHooks;
+    private readonly SubscriberList<PreHookInfo>  _preHooks;
+    private readonly SubscriberList<PostHookInfo> _postHooks;
 
     private readonly ILogger _logger;
 
-    protected abstract bool AllowPre  { get; }
-    protected abstract bool AllowPost { get; }
+    protected abstract bool            AllowPre         { get; }
+    protected abstract bool            AllowPost        { get; }
+    protected abstract HookActionFlags SupportedActions { get; }
 
     protected HookType(ILoggerFactory factory)
     {
-        _preHooks  = [];
-        _postHooks = [];
+        _preHooks  = new SubscriberList<PreHookInfo>(x => x.Priority);
+        _postHooks = new SubscriberList<PostHookInfo>(x => x.Priority);
 
         _logger = factory.CreateLogger<TClass>();
     }
@@ -98,13 +101,25 @@ internal abstract class HookType<TParams, THookReturn, TClass> : ICoreHookType<T
             throw new InvalidOperationException($"Pre Hook of {GetType().Name} is not support");
         }
 
-        if (_preHooks.Any(x => x.Callback.Equals(pre)))
+        if (!pre.HasSingleTarget)
+        {
+            throw new ArgumentException("Multicast delegates are not supported, install each callback separately",
+                                        nameof(pre));
+        }
+
+        if (UnloadCleanupObject.AssemblyManager?.IsDelegateUnloaded(pre) == true)
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
+        if (_preHooks.Exists(x => x.Callback.Equals(pre)))
         {
             return;
         }
 
         _preHooks.Add(new PreHookInfo(pre, priority));
-        _preHooks.Sort((x, y) => y.Priority.CompareTo(x.Priority));
     }
 
     public void InstallHookPost(Action<TParams, HookReturnValue<THookReturn>> post, int priority)
@@ -114,13 +129,25 @@ internal abstract class HookType<TParams, THookReturn, TClass> : ICoreHookType<T
             throw new InvalidOperationException($"Post Hook of {GetType().Name} is not support");
         }
 
-        if (_postHooks.Any(x => x.Equals(post)))
+        if (!post.HasSingleTarget)
+        {
+            throw new ArgumentException("Multicast delegates are not supported, install each callback separately",
+                                        nameof(post));
+        }
+
+        if (UnloadCleanupObject.AssemblyManager?.IsDelegateUnloaded(post) == true)
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
+        if (_postHooks.Exists(x => x.Callback.Equals(post)))
         {
             return;
         }
 
         _postHooks.Add(new PostHookInfo(post, priority));
-        _postHooks.Sort((x, y) => y.Priority.CompareTo(x.Priority));
     }
 
     public void RemoveHookPre(Func<TParams, HookReturnValue<THookReturn>, HookReturnValue<THookReturn>> pre)
@@ -153,12 +180,23 @@ internal abstract class HookType<TParams, THookReturn, TClass> : ICoreHookType<T
         var          action = EHookAction.Ignored;
         THookReturn? result = default;
 
-        for (var i = 0; i < _preHooks.Count; i++)
+        foreach (var hook in _preHooks)
         {
             try
             {
-                var hook = _preHooks[i];
                 var call = hook.Callback(@params, new HookReturnValue<THookReturn>(action, result));
+
+                if (call.Action != EHookAction.Ignored && !IsActionSupported(call.Action))
+                {
+                    _logger.LogError(
+                        "Pre hook {callback} of module [{module}] returned unsupported action {action} for {type}, treated as Ignored",
+                        hook.Callback.GetMethodSignature(),
+                        hook.Callback.Method.Module.Assembly.GetName().Name,
+                        call.Action,
+                        GetType().Name);
+
+                    continue;
+                }
 
                 if (call.Action > action)
                 {
@@ -177,6 +215,9 @@ internal abstract class HookType<TParams, THookReturn, TClass> : ICoreHookType<T
         return new HookReturnValue<THookReturn>(action, result);
     }
 
+    private bool IsActionSupported(EHookAction action)
+        => action <= EHookAction.SkipCallReturnOverride && ((byte) SupportedActions & (1 << (int) action)) != 0;
+
     public void InvokeHookPost(TParams @params, HookReturnValue<THookReturn> @return)
     {
         if (_postHooks.Count == 0)
@@ -184,11 +225,11 @@ internal abstract class HookType<TParams, THookReturn, TClass> : ICoreHookType<T
             return;
         }
 
-        for (var i = 0; i < _postHooks.Count; i++)
+        foreach (var hook in _postHooks)
         {
             try
             {
-                _postHooks[i].Callback(@params, @return);
+                hook.Callback(@params, @return);
             }
             catch (Exception e)
             {
@@ -199,6 +240,12 @@ internal abstract class HookType<TParams, THookReturn, TClass> : ICoreHookType<T
 
     public bool IsHookInvokeRequired(bool isPost)
         => !isPost ? _preHooks.Count != 0 : _postHooks.Count != 0;
+
+    internal override void ClearLeakedHooks(ICoreAssemblyManager assemblyManager)
+    {
+        _preHooks.Edit(x => assemblyManager.ClearLeakedCallbacks(x, $"{GetType().Name}<pre>", y => y.Callback));
+        _postHooks.Edit(x => assemblyManager.ClearLeakedCallbacks(x, $"{GetType().Name}<post>", y => y.Callback));
+    }
 }
 
 #endregion
@@ -212,32 +259,47 @@ internal interface ICoreForwardType<in TParams> where TParams : class, IFunction
     bool IsForwardInvokeRequired();
 }
 
-internal abstract class ForwardType<TParams, TClass> : ICoreForwardType<TParams>, IForwardType<TParams>
+internal abstract class ForwardType<TParams, TClass> : UnloadCleanupObject, ICoreForwardType<TParams>, IForwardType<TParams>
     where TParams : class, IFunctionParams
     where TClass : ForwardType<TParams, TClass>
 {
     private record HookInfo(Action<TParams> Callback, int Priority);
 
-    private readonly List<HookInfo> _hooks;
+    private readonly SubscriberList<HookInfo> _hooks;
 
     private readonly ILogger<TClass> _logger;
 
     protected ForwardType(ILoggerFactory factory)
     {
-        _hooks  = [];
+        _hooks  = new SubscriberList<HookInfo>(x => x.Priority);
         _logger = factory.CreateLogger<TClass>();
     }
 
     public void InstallForward(Action<TParams> func, int priority)
     {
-        if (_hooks.Any(x => x.Callback.Equals(func)))
+        if (!func.HasSingleTarget)
+        {
+            throw new ArgumentException("Multicast delegates are not supported, install each callback separately",
+                                        nameof(func));
+        }
+
+        if (UnloadCleanupObject.AssemblyManager?.IsDelegateUnloaded(func) == true)
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
+        if (_hooks.Exists(x => x.Callback.Equals(func)))
         {
             return;
         }
 
         _hooks.Add(new HookInfo(func, priority));
-        _hooks.Sort((x, y) => y.Priority.CompareTo(x.Priority));
     }
+
+    internal override void ClearLeakedHooks(ICoreAssemblyManager assemblyManager)
+        => _hooks.Edit(x => assemblyManager.ClearLeakedCallbacks(x, GetType().Name, y => y.Callback));
 
     public void RemoveForward(Action<TParams> func)
     {
@@ -256,11 +318,11 @@ internal abstract class ForwardType<TParams, TClass> : ICoreForwardType<TParams>
             return;
         }
 
-        for (var i = 0; i < _hooks.Count; i++)
+        foreach (var hook in _hooks)
         {
             try
             {
-                _hooks[i].Callback(@params);
+                hook.Callback(@params);
             }
             catch (Exception e)
             {
@@ -386,8 +448,21 @@ internal class HookManager : ICoreHookManager
 
 #endregion
 
-    public HookManager(ILoggerFactory factory)
+    public HookManager(ILoggerFactory factory, ICoreAssemblyManager assemblyManager)
     {
+        UnloadCleanupObject.AssemblyManager = assemblyManager;
+
+        assemblyManager.RegisterUnloadCleanup(() =>
+        {
+            foreach (var field in typeof(HookManager).GetFields(BindingFlags.NonPublic | BindingFlags.Instance))
+            {
+                if (field.GetValue(this) is UnloadCleanupObject source)
+                {
+                    source.ClearLeakedHooks(assemblyManager);
+                }
+            }
+        });
+
         _clientCanHear             = new ClientCanHearHook(factory);
         _clientConnect             = new ClientConnectHook(factory);
         _connectClient             = new ConnectClientHook(factory);

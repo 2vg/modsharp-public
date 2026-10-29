@@ -50,6 +50,11 @@ static CConVarBaseData* ms_fix_server_query_players = nullptr;
 
 static std::unordered_map<uint64_t, int32_t> s_bBannedSteamIds;
 
+void BanSteamIdInternal(uint64_t steamId, int32_t reason)
+{
+    s_bBannedSteamIds[steamId] = reason;
+}
+
 #define ENGINE_HOOK_ASSERT
 // #define CONNECT_HOOK_ASSERT
 
@@ -134,6 +139,9 @@ BeginMemberHookScope(CNetworkGameServer)
         sv        = pServer;
         gpGlobals = pServer->GetGlobalVars();
 
+        // clear ban cache
+        s_bBannedSteamIds.clear();
+
 #ifdef ENGINE_HOOK_ASSERT
         WARN("%10s: 0x%p\n"
              "%10s: %f\n"
@@ -206,7 +214,7 @@ BeginMemberHookScope(CNetworkGameServer)
             return pResult;
 
         const auto pClients = pServer->GetClients();
-        if (pClients->Count() < static_cast<int>(gpGlobals->MaxClients))
+        if (pClients->Count() < static_cast<int>(pServer->GetGlobalVars()->MaxClients))
             return pResult;
 
         for (auto i = pClients->Count() - 1; i >= 0; i--)
@@ -222,7 +230,7 @@ BeginMemberHookScope(CNetworkGameServer)
         return nullptr;
     }
 
-    DeclareMemberDetourHook(ConnectClient, CServerSideClient*, (CNetworkGameServer * pServer, const char* pName, netadr_t* pNetAddress, void* pNetInfo, C2S_CONNECT_Message* pMsg, const char* pszPassword, const void* hashedCdKey, int cdkeyLength, bool bLowViolence))
+    DeclareMemberDetourHook(ConnectClient, CServerSideClient*, (CNetworkGameServer * pServer, const char* pName, netadr_t* pNetAddress, uint32_t pNetInfo, C2S_CONNECT_Message* pMsg, const char* pszPassword, const void* hashedCdKey, int cdkeyLength, bool bLowViolence))
     {
 #ifdef CONNECT_HOOK_ASSERT
         WARN("%10s: 0x%p\n" // CNetworkGameServer*

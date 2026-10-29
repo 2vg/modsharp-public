@@ -19,6 +19,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using Microsoft.Extensions.Logging;
 using Sharp.Core.Objects;
@@ -37,20 +38,26 @@ internal interface ICoreConVarManager : IConVarManager;
 internal class ConVarManager : ICoreConVarManager
 {
     private readonly ILogger<ConVarManager> _logger;
+    private readonly ICoreAssemblyManager   _assemblyManager;
 
     private readonly Dictionary<nint /* ConVar Ptr */, IConVarManager.DelegateConVarChange?>                    _conVarHooks;
     private readonly Dictionary<long /* ConCommandHandle */, Func<IGameClient?, StringCommand, ECommandAction>> _commands;
     private readonly Dictionary<long /* ConCommandHandle */, Func<StringCommand, ECommandAction>>               _serverCommands;
+    private readonly Dictionary<long /* ConCommandHandle */, string>                                            _commandNames;
 
-    public ConVarManager(ILogger<ConVarManager> logger)
+    public ConVarManager(ILogger<ConVarManager> logger, ICoreAssemblyManager assemblyManager)
     {
-        _logger         = logger;
-        _conVarHooks    = new Dictionary<nint, IConVarManager.DelegateConVarChange?>();
-        _commands       = new Dictionary<long, Func<IGameClient?, StringCommand, ECommandAction>>();
-        _serverCommands = new Dictionary<long, Func<StringCommand, ECommandAction>>();
+        _logger          = logger;
+        _assemblyManager = assemblyManager;
+        _conVarHooks     = new Dictionary<nint, IConVarManager.DelegateConVarChange?>();
+        _commands        = new Dictionary<long, Func<IGameClient?, StringCommand, ECommandAction>>();
+        _serverCommands  = new Dictionary<long, Func<StringCommand, ECommandAction>>();
+        _commandNames    = new Dictionary<long, string>();
 
         Forward.OnConVarChanged     += OnConVarChanged;
         Forward.OnConCommandTrigger += OnConCommandTrigger;
+
+        _assemblyManager.RegisterUnloadCleanup(ClearLeakedRegistrations);
 
         var version = Assembly.GetExecutingAssembly().GetName().Version!;
 
@@ -75,14 +82,70 @@ internal class ConVarManager : ICoreConVarManager
             return;
         }
 
-        callbacks.Invoke(conVar);
+        foreach (var callback in Delegate.EnumerateInvocationList(callbacks))
+        {
+            try
+            {
+                callback.Invoke(conVar);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "An error occurred while calling ConVar change callback of <{name}>", conVar.Name);
+            }
+        }
     }
 
     public IConVar? FindConVar(string name, bool useIterator = false)
         => ConVar.Create(Native.FindConVar(name, useIterator));
 
+    private void ClearLeakedRegistrations()
+    {
+        foreach (var key in _conVarHooks.Keys.ToArray())
+        {
+            var cleaned = _assemblyManager.ClearLeakedMulticast(_conVarHooks[key], "ConVarChangeHook", $"0x{key:X}");
+
+            if (cleaned is not null)
+            {
+                _conVarHooks[key] = cleaned;
+
+                continue;
+            }
+
+            _conVarHooks.Remove(key);
+            Native.RemoveChangeHook(key);
+        }
+
+        ClearLeakedCommands(_commands, "ConsoleCommand");
+        ClearLeakedCommands(_serverCommands, "ServerCommand");
+    }
+
+    private void ClearLeakedCommands<T>(Dictionary<long, T> commands, string kind) where T : Delegate
+    {
+        foreach (var handle in commands.Keys.ToArray())
+        {
+            var cleaned = _assemblyManager.ClearLeakedMulticast(commands[handle], kind, handle.ToString());
+
+            if (cleaned is null)
+            {
+                commands.Remove(handle);
+                ReleaseCommandIfDrained(handle);
+            }
+            else
+            {
+                commands[handle] = cleaned;
+            }
+        }
+    }
+
     public void InstallChangeHook(IConVar conVar, IConVarManager.DelegateConVarChange callback)
     {
+        if (_assemblyManager.IsDelegateUnloaded(callback))
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
         var key = conVar.GetAbsPtr();
 
         if (_conVarHooks.ContainsKey(key))
@@ -109,6 +172,8 @@ internal class ConVarManager : ICoreConVarManager
 
         if (callbacks is not null)
         {
+            _conVarHooks[key] = callbacks;
+
             return;
         }
 
@@ -158,7 +223,7 @@ internal class ConVarManager : ICoreConVarManager
         ushort                          max,
         string?                         helpString = null,
         ConVarFlags?                    flags      = null)
-        => CreateConVarInternal(ConVarType.Int16,
+        => CreateConVarInternal(ConVarType.UInt16,
                                 name,
                                 new ConVarVariantValue(defaultValue),
                                 flags,
@@ -170,7 +235,7 @@ internal class ConVarManager : ICoreConVarManager
         ushort                          defaultValue,
         string?                         helpString = null,
         ConVarFlags?                    flags      = null)
-        => CreateConVarInternal(ConVarType.Int16,
+        => CreateConVarInternal(ConVarType.UInt16,
                                 name,
                                 new ConVarVariantValue(defaultValue),
                                 flags,
@@ -206,7 +271,7 @@ internal class ConVarManager : ICoreConVarManager
         uint                            max,
         string?                         helpString = null,
         ConVarFlags?                    flags      = null)
-        => CreateConVarInternal(ConVarType.Int32,
+        => CreateConVarInternal(ConVarType.UInt32,
                                 name,
                                 new ConVarVariantValue(defaultValue),
                                 flags,
@@ -218,7 +283,7 @@ internal class ConVarManager : ICoreConVarManager
         uint                            defaultValue,
         string?                         helpString = null,
         ConVarFlags?                    flags      = null)
-        => CreateConVarInternal(ConVarType.Int32,
+        => CreateConVarInternal(ConVarType.UInt32,
                                 name,
                                 new ConVarVariantValue(defaultValue),
                                 flags,
@@ -230,7 +295,7 @@ internal class ConVarManager : ICoreConVarManager
         long                            max,
         string?                         helpString = null,
         ConVarFlags?                    flags      = null)
-        => CreateConVarInternal(ConVarType.Int32,
+        => CreateConVarInternal(ConVarType.Int64,
                                 name,
                                 new ConVarVariantValue(defaultValue),
                                 flags,
@@ -242,7 +307,7 @@ internal class ConVarManager : ICoreConVarManager
         long                            defaultValue,
         string?                         helpString = null,
         ConVarFlags?                    flags      = null)
-        => CreateConVarInternal(ConVarType.Int32,
+        => CreateConVarInternal(ConVarType.Int64,
                                 name,
                                 new ConVarVariantValue(defaultValue),
                                 flags,
@@ -254,7 +319,7 @@ internal class ConVarManager : ICoreConVarManager
         ulong                           max,
         string?                         helpString = null,
         ConVarFlags?                    flags      = null)
-        => CreateConVarInternal(ConVarType.Int32,
+        => CreateConVarInternal(ConVarType.UInt64,
                                 name,
                                 new ConVarVariantValue(defaultValue),
                                 flags,
@@ -266,7 +331,7 @@ internal class ConVarManager : ICoreConVarManager
         ulong                           defaultValue,
         string?                         helpString = null,
         ConVarFlags?                    flags      = null)
-        => CreateConVarInternal(ConVarType.Int32,
+        => CreateConVarInternal(ConVarType.UInt64,
                                 name,
                                 new ConVarVariantValue(defaultValue),
                                 flags,
@@ -347,25 +412,53 @@ internal class ConVarManager : ICoreConVarManager
         var command   = buffer[..commandEndIndex].ToString();
         var arguments = buffer[commandEndIndex..].Trim().ToString();
 
-        {
-            if (_commands.TryGetValue(handle, out var cb))
-            {
-                var context = new StringCommand(command, false, arguments);
+        var action = ECommandAction.Skipped;
 
-                cb.Invoke(client, context);
+        if (_commands.TryGetValue(handle, out var clientCommandCallbacks))
+        {
+            var context = new StringCommand(command, false, arguments);
+
+            foreach (var callback in Delegate.EnumerateInvocationList(clientCommandCallbacks))
+            {
+                try
+                {
+                    var result = callback.Invoke(client, context);
+
+                    if (result > action)
+                    {
+                        action = result;
+                    }
+                }
+                catch (Exception e)
+                {
+                    _logger.LogError(e, "An error occurred while calling console command callback: {command}", command);
+                }
             }
         }
 
+        if (client is null && _serverCommands.TryGetValue(handle, out var serverCommandCallbacks))
         {
-            if (_serverCommands.TryGetValue(handle, out var cb))
-            {
-                var context = new StringCommand(command, false, arguments);
+            var context = new StringCommand(command, false, arguments);
 
-                cb.Invoke(context);
+            foreach (var callback in Delegate.EnumerateInvocationList(serverCommandCallbacks))
+            {
+                try
+                {
+                    var result = callback.Invoke(context);
+
+                    if (result > action)
+                    {
+                        action = result;
+                    }
+                }
+                catch (Exception e)
+                {
+                    _logger.LogError(e, "An error occurred while calling server command callback: {command}", command);
+                }
             }
         }
 
-        return ECommandAction.Stopped;
+        return action;
     }
 
     public void CreateConsoleCommand(string               name,
@@ -373,6 +466,13 @@ internal class ConVarManager : ICoreConVarManager
         string?                                           description = null,
         ConVarFlags?                                      flags       = null)
     {
+        if (_assemblyManager.IsDelegateUnloaded(fn))
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
         var handle = Native.CreateCommand(name,
                                           description ?? string.Empty,
                                           flags
@@ -382,6 +482,8 @@ internal class ConVarManager : ICoreConVarManager
         {
             throw new InvalidOperationException($"Failed to create console command <{name}>");
         }
+
+        _commandNames[handle] = name;
 
         if (_commands.ContainsKey(handle))
         {
@@ -398,6 +500,13 @@ internal class ConVarManager : ICoreConVarManager
         string?                             description = null,
         ConVarFlags?                        flags       = null)
     {
+        if (_assemblyManager.IsDelegateUnloaded(fn))
+        {
+            _logger.LogError("Install rejected, module already unloaded!\n{stackTrace}", Environment.StackTrace);
+
+            return;
+        }
+
         var handle = Native.CreateCommand(name,
                                           description ?? string.Empty,
                                           flags
@@ -407,6 +516,8 @@ internal class ConVarManager : ICoreConVarManager
         {
             throw new InvalidOperationException($"Failed to create server command <{name}>");
         }
+
+        _commandNames[handle] = name;
 
         if (_serverCommands.ContainsKey(handle))
         {
@@ -418,6 +529,68 @@ internal class ConVarManager : ICoreConVarManager
         }
     }
 
+    // engine command is released automatically once its callbacks drain
     public bool ReleaseCommand(string name)
-        => Native.ReleaseCommand(name);
+        => false;
+
+    public void ReleaseConsoleCommandCallback(string name, Func<IGameClient?, StringCommand, ECommandAction> fn)
+    {
+        var handle = Native.FindSharpCommandHandle(name);
+
+        if (!_commands.TryGetValue(handle, out var cb))
+        {
+            _logger.LogWarning("Release rejected, console command <{name}> is not registered!", name);
+
+            return;
+        }
+
+        cb -= fn;
+
+        if (cb is null)
+        {
+            _commands.Remove(handle);
+            ReleaseCommandIfDrained(handle);
+        }
+        else
+        {
+            _commands[handle] = cb;
+        }
+    }
+
+    public void ReleaseServerCommandCallback(string name, Func<StringCommand, ECommandAction> fn)
+    {
+        var handle = Native.FindSharpCommandHandle(name);
+
+        if (!_serverCommands.TryGetValue(handle, out var cb))
+        {
+            _logger.LogWarning("Release rejected, server command <{name}> is not registered!", name);
+
+            return;
+        }
+
+        cb -= fn;
+
+        if (cb is null)
+        {
+            _serverCommands.Remove(handle);
+            ReleaseCommandIfDrained(handle);
+        }
+        else
+        {
+            _serverCommands[handle] = cb;
+        }
+    }
+
+    private void ReleaseCommandIfDrained(long handle)
+    {
+        if (_commands.ContainsKey(handle) || _serverCommands.ContainsKey(handle))
+        {
+            return;
+        }
+
+        if (_commandNames.Remove(handle, out var name))
+        {
+            Native.ReleaseCommand(name);
+        }
+    }
 }

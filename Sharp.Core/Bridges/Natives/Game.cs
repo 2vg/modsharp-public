@@ -115,7 +115,9 @@ public static unsafe partial class Game
 
     public static partial nint GetMapGroupMapList(string mapGroup);
 
-    public static partial NativeSpan<byte> FindResourceDataBlockInfo(string fileName, string pathId);
+    public static partial int FindResourceDataBlockInfo(string fileName, string pathId);
+
+    public static partial void CopyResourceDataBlock(byte* output, int size);
 
     public static partial ResourceStatus GetResourceStatus(string fileName);
 
@@ -127,9 +129,21 @@ public static unsafe partial class Game
 
     public static partial nint FindWeaponVDataByName(string name);
 
-    public static partial void DualAddonPurgeCheck();
+    public static partial NativeSpan<ulong> AddonGetAddons();
 
-    public static partial void DualAddonOverrideCheck(ulong steamId, double time);
+    public static partial void AddonSetAddons(ulong* addons, int count);
+
+    public static partial void AddonResetClientCache(ulong steamId);
+
+    public static partial bool AddonRefreshClient(ulong steamId, bool resetCache);
+
+    public static partial bool AddonUpdateAddon(ulong fileId, bool reloadMap);
+
+    public static partial void AddonReloadMap();
+
+    public static partial void AddonSetOptions(float clientTimeout, float connectionTimeout, float cacheDuration, bool debug);
+
+    public static partial void AddonSetClientQueryEnabled(bool enabled);
 
     public static partial bool AddWorkshopMap(ulong sharedFileId, string name, string path);
 

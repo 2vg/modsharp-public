@@ -179,7 +179,7 @@ public class MethodSymbolParamContext
         var returnStr = ReturnType switch
         {
             "void"   => "PLACEHOLDER;",
-            "string" => "var __result = new string(PLACEHOLDER);",
+            "string" => "var __result = Sharp.Shared.Utilities.Utils.ReadString(PLACEHOLDER);",
             _        => "var __result = PLACEHOLDER;",
         };
 
@@ -188,7 +188,7 @@ public class MethodSymbolParamContext
             returnStr = ReturnType switch
             {
                 "void"   => "PLACEHOLDER;",
-                "string" => "__result = new string(PLACEHOLDER);",
+                "string" => "__result = Sharp.Shared.Utilities.Utils.ReadString(PLACEHOLDER);",
                 _        => "__result = PLACEHOLDER;",
             };
 
@@ -268,7 +268,9 @@ public class MethodSymbolParamContext
                 builder.AppendLine("{");
             }
 
-            builder.AppendLine($"Utf8.FromUtf16({p.Name}, {p.Name}Bytes, out _, out var {p.Name}BytesWritten);");
+            var destination = p.Utf8Size > 0 ? $"{p.Name}Bytes[..{p.Utf8Size}]" : $"{p.Name}Bytes";
+
+            builder.AppendLine($"Utf8.FromUtf16({p.Name}, {destination}, out _, out var {p.Name}BytesWritten);");
 
             builder.AppendLine($"{p.Name}Bytes[{p.Name}BytesWritten] = 0;");
 

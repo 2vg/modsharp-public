@@ -1,4 +1,4 @@
-/* 
+/*
  * ModSharp
  * Copyright (C) 2023-2026 Kxnrl. All Rights Reserved.
  *
@@ -17,19 +17,13 @@
  * along with ModSharp. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef CSTRIKE_TYPE_NETWORKVELOCITYVECTOR_H
-#define CSTRIKE_TYPE_NETWORKVELOCITYVECTOR_H
+namespace Sharp.Shared.Types;
 
-#include "cstrike/schema.h"
-
-class CNetworkVelocityVector
+public readonly record struct NativeFunctionInfo
 {
-public:
-    DECLARE_SCHEMA_STRUCT(CNetworkVelocityVector)
+    public required string RawName { get; init; }
 
-    SCHEMA_FIELD(float, m_vecX)
-    SCHEMA_FIELD(float, m_vecY)
-    SCHEMA_FIELD(float, m_vecZ)
-};
+    public required string Signature { get; init; }
 
-#endif
+    public nint Address { get; init; }
+}

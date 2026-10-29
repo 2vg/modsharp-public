@@ -52,7 +52,7 @@ BeginMemberHookScope(CSoundEmitterSystem)
 #ifdef PLATFORM_WINDOWS
     DeclareMemberDetourHook(EmitSound, void, (void* pThis, StartSoundEventInfo_t* pInfo, IRecipientFilter* pFilter, EntityIndex_t entityIndex, EmitSound_t* pSound))
 #else
-    DeclareMemberDetourHook(EmitSound, StartSoundEventInfo_t*, (SndOpEventGuid_t * pThis, IRecipientFilter * pFilter, EntityIndex_t entityIndex, EmitSound_t * pSound))
+    DeclareMemberDetourHook(EmitSound, StartSoundEventInfo_t*, (StartSoundEventInfo_t * pThis, IRecipientFilter * pFilter, EntityIndex_t entityIndex, EmitSound_t * pSound))
 #endif
     {
         // NOTE
@@ -61,10 +61,16 @@ BeginMemberHookScope(CSoundEmitterSystem)
 
 #ifdef PLATFORM_WINDOWS
         if (!pSound)
+        {
+            *pInfo = g_DefaultStartSoundEventInfo;
             return;
+        }
 #else
         if (!pSound)
-            return &g_DefaultStartSoundEventInfo;
+        {
+            *pThis = g_DefaultStartSoundEventInfo;
+            return pThis;
+        }
 #endif
 
 #ifdef SOUND_HOOK_ASSERT
@@ -91,7 +97,8 @@ BeginMemberHookScope(CSoundEmitterSystem)
             *pInfo = g_DefaultStartSoundEventInfo;
             return;
 #else
-            return &g_DefaultStartSoundEventInfo;
+            *pThis = g_DefaultStartSoundEventInfo;
+            return pThis;
 #endif
         }
         case EHookAction::ChangeParamReturnDefault: {
@@ -196,7 +203,10 @@ BeginMemberHookScope(SoundOpGameSystem)
         if (!pEntity)
             return false;
 
-        return strcasecmp(pEntity->GetClassname(), "ambient_generic") == 0;
+        static const auto s_pAmbientGenericClass = g_pGameEntitySystem->FindEntityClassByName("ambient_generic");
+        AssertPtr(s_pAmbientGenericClass);
+
+        return pEntity->IsEntityClass(s_pAmbientGenericClass);
     }
 
     struct PackedData
@@ -277,7 +287,7 @@ BeginMemberHookScope(SoundOpGameSystem)
         switch (action)
         {
         case EHookAction::SkipCallReturnOverride: {
-            pInfo->m_nSndOpEventGuid = g_DefaultSndOpEventGuid;
+            *pInfo = g_DefaultStartSoundEventInfo;
             return;
         }
         case EHookAction::ChangeParamReturnDefault: {

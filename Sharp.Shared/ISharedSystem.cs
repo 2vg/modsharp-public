@@ -38,6 +38,8 @@ public interface ISharedSystem
 
     ILoggerFactory GetLoggerFactory();
 
+    ILoggingManager GetLoggingManager();
+
     ITransmitManager GetTransmitManager();
 
     IFileManager GetFileManager();
@@ -55,4 +57,13 @@ public interface ISharedSystem
     ISharpModuleManager GetSharpModuleManager();
 
     IParticleManager GetParticleManager();
+
+    /// <summary>
+    ///     Low-level workshop addon delivery, use the <c>Sharp.Modules.AddonManager</c> module instead
+    /// </summary>
+    IAddonManager GetAddonManager();
+
+    IScriptManager GetScriptManager();
+
+    IPanoramaManager GetPanoramaManager();
 }

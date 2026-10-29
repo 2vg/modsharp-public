@@ -29,10 +29,12 @@
 #include "cstrike/component/PlayerPawnComponent.h"
 #include "cstrike/entity/PlayerController.h"
 #include "cstrike/entity/PlayerPawn.h"
+#include "cstrike/interface/ICvar.h"
 #include "cstrike/type/CGlobalVars.h"
 #include "cstrike/type/CMoveData.h"
 #include "cstrike/type/CNetworkGameServer.h"
 #include "cstrike/type/CServerSideClient.h"
+#include "cstrike/type/CUserCmd.h"
 #include "cstrike/type/VProf.h"
 
 #include <proto/cs_usercmd.pb.h>
@@ -42,7 +44,11 @@
 #include <Zydis.h>
 #include <safetyhook.hpp>
 
+#include <format>
+
 // #define LOG_FIX_TICKCOUNT
+
+extern bool IsPushFixEnabled();
 
 volatile float g_flReplaceMaxSpeed;
 volatile bool  g_bInWalkMove;
@@ -53,6 +59,7 @@ static float m_flRunSpeedValue[CS_MAX_PLAYERS];
 static CConVarBaseData* ms_disable_usercmd_subtick_moves = nullptr;
 static CConVarBaseData* ms_disable_usercmd_subtick_input = nullptr;
 static CConVarBaseData* ms_fix_usercmd_rapid_fire        = nullptr;
+static CConVarBaseData* ms_water_ground_jump_velocity    = nullptr;
 
 struct CUserCmdInButtonState
 {
@@ -216,24 +223,129 @@ BeginMemberHookScope(CCSPlayer_MovementServices)
     // Fix mega push
     DeclareVirtualHook(CheckMovingGround, void, (CCSPlayer_MovementServices * pService, double frametime))
     {
-        ValidateCP();
+        if (!IsPushFixEnabled())
+            return CheckMovingGround(pService, frametime);
 
-        const auto slot = pController->GetPlayerSlot();
+        const auto pPawn = pService->GetPawn<CCSPlayerPawn*>();
+        AssertPtr(pPawn);
 
-        static int32_t nPlayerTicks[CS_MAX_PLAYERS];
+        if (const auto pController = pPawn->GetOriginalController<CCSPlayerController*>())
+        {
+            const auto slot = pController->GetPlayerSlot();
 
-        if (nPlayerTicks[slot] == gpGlobals->nTickCount)
-            return;
+            static int32_t nPlayerTicks[CS_MAX_PLAYERS];
 
-        nPlayerTicks[slot] = gpGlobals->nTickCount;
+            if (nPlayerTicks[slot] == gpGlobals->nTickCount)
+                return;
+
+            nPlayerTicks[slot] = gpGlobals->nTickCount;
+        }
 
         CheckMovingGround(pService, frametime);
+    }
+
+    static bool IsModernWaterJump(CCSPlayerPawn * pPawn, CCSPlayer_MovementServices * pService)
+    {
+        static CConVarBaseData* pLegacyJumpConVar = icvar ? icvar->FindConVarIterator("sv_legacy_jump") : nullptr;
+        if (!pLegacyJumpConVar || pLegacyJumpConVar->GetValue<bool>())
+            return false;
+
+        if (pPawn->m_flWaterLevel() < 0.5f)
+            return false;
+
+        static CConVarBaseData* pAutoBhopConVar = icvar ? icvar->FindConVarIterator("sv_autobunnyhopping") : nullptr;
+        if (pAutoBhopConVar && pAutoBhopConVar->GetValue<bool>())
+            return true;
+
+        constexpr auto mask    = static_cast<uint64_t>(EButtons::IN_JUMP);
+        const auto&    buttons = pService->m_nButtons()->m_pButtonStates();
+        const bool     held    = (static_cast<uint64_t>(buttons.m_nKeyButtons) & mask) != 0;
+        const bool     changed = (static_cast<uint64_t>(buttons.m_nKeyButtonsChanged) & mask) != 0;
+        const bool     scroll  = (static_cast<uint64_t>(buttons.m_nScrollButtons) & mask) != 0;
+        return scroll || (held && changed);
+    }
+
+    static bool IsWaterGroundJump(CCSPlayerPawn * pPawn, CCSPlayer_MovementServices * pService)
+    {
+        if (pPawn->m_nActualMoveType() != MOVETYPE_WALK || !(pPawn->GetFlags() & FL_ONGROUND) || pPawn->m_flWaterLevel() < 0.5f)
+            return false;
+
+        constexpr auto mask    = static_cast<uint64_t>(EButtons::IN_JUMP);
+        const auto&    buttons = pService->m_nButtons()->m_pButtonStates();
+        return ((static_cast<uint64_t>(buttons.m_nKeyButtons) | static_cast<uint64_t>(buttons.m_nScrollButtons)) & mask) != 0;
+    }
+
+    static bool ForceJumpPress(CCSPlayer_MovementServices * pService)
+    {
+        constexpr auto mask    = static_cast<uint64_t>(EButtons::IN_JUMP);
+        auto&          buttons = pService->m_nButtons()->m_pButtonStates();
+        const auto     changed = static_cast<uint64_t>(buttons.m_nKeyButtonsChanged);
+        if ((static_cast<uint64_t>(buttons.m_nKeyButtons) & mask) == 0 || (changed & mask) != 0)
+            return false;
+
+        buttons.m_nKeyButtonsChanged = static_cast<EButtons>(changed | mask);
+        return true;
+    }
+
+    static void RevertJumpPress(CCSPlayer_MovementServices * pService)
+    {
+        constexpr auto mask          = static_cast<uint64_t>(EButtons::IN_JUMP);
+        auto&          buttons       = pService->m_nButtons()->m_pButtonStates();
+        buttons.m_nKeyButtonsChanged = static_cast<EButtons>(static_cast<uint64_t>(buttons.m_nKeyButtonsChanged) & ~mask);
+    }
+
+    DeclareMemberDetourHook(CheckLegacyJump, void, (CStrikeObject * pJump, CMoveData * pMoveData))
+    {
+        static int offset   = schemas::GetOffset("CCSPlayer_MovementServices", "m_LegacyJump").offset;
+        const auto pService = pJump->GetFieldPointer<CCSPlayer_MovementServices*>(-offset);
+
+        const auto pPawn = pService->GetPawn<CCSPlayerPawn*>();
+        AssertPtr(pPawn);
+
+        const auto bGroundJump  = IsWaterGroundJump(pPawn, pService);
+        const auto bForcedPress = bGroundJump && ForceJumpPress(pService);
+
+        CheckLegacyJump(pJump, pMoveData);
+
+        if (bForcedPress)
+            RevertJumpPress(pService);
+
+        if (bGroundJump && pMoveData->m_vecVelocity.z == 100.0f)
+            pMoveData->m_vecVelocity.z = ms_water_ground_jump_velocity->GetValue<float>();
+    }
+
+    DeclareMemberDetourHook(CheckModernJump, void, (CStrikeObject * pJump, CMoveData * pMoveData))
+    {
+        static int offset   = schemas::GetOffset("CCSPlayer_MovementServices", "m_ModernJump").offset;
+        const auto pService = pJump->GetFieldPointer<CCSPlayer_MovementServices*>(-offset);
+
+        const auto pPawn = pService->GetPawn<CCSPlayerPawn*>();
+        AssertPtr(pPawn);
+
+        const auto bGroundJump  = IsWaterGroundJump(pPawn, pService);
+        const auto bForcedPress = bGroundJump && ForceJumpPress(pService);
+
+        if (IsModernWaterJump(pPawn, pService))
+        {
+            static const int nLegacyJumpOffset = schemas::GetOffset("CCSPlayer_MovementServices", "m_LegacyJump").offset;
+            CheckLegacyJump(pService->GetFieldPointer<CStrikeObject*>(nLegacyJumpOffset), pMoveData);
+        }
+        else
+        {
+            CheckModernJump(pJump, pMoveData);
+        }
+
+        if (bForcedPress)
+            RevertJumpPress(pService);
+
+        if (bGroundJump && pMoveData->m_vecVelocity.z == 100.0f)
+            pMoveData->m_vecVelocity.z = ms_water_ground_jump_velocity->GetValue<float>();
     }
 }
 
 BeginMemberHookScope(CCSPlayerController)
 {
-    DeclareMemberDetourHook(ProcessUserCommands, void, (CCSPlayerController * pController, CUserCmd * pCommands, int commandCount, bool paused, float margin))
+    DeclareMemberDetourHook(ProcessUserCommands, int, (CCSPlayerController * pController, CUserCmd * pCommands, int commandCount, bool paused, float margin))
     {
         VPROF_MS_HOOK();
 
@@ -338,62 +450,171 @@ BeginMemberHookScope(CCSPlayerController)
     }
 }
 
-static void PatchJumpInWaterVelocityZ()
+static CAddress FindCPlayerMovementService_RunCommand()
 {
-    auto addresses = modules::server->FindPatternMulti("00 00 C8 42");
+    auto svr_mod = modules::server;
 
-    static constexpr int32_t        vel_offset     = offsetof(CMoveData, m_vecVelocity.z);
-    static constexpr uint32_t       new_z_velocity = 0x43110000; // 145.0f
-    constexpr std::array<int8_t, 2> offsets        = {-3, -4};
-
-    for (auto address : addresses)
+    auto vfuncs = svr_mod->GetVFunctionsFromVTable("CPlayer_MovementServices");
+    if (vfuncs.empty())
     {
-        for (int8_t offset : offsets)
-        {
-            auto instruction_address = address.Offset(offset);
-
-            ZydisDecodedInstruction instr{};
-            ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT]{};
-
-            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&ZydisUtility::DefaultDecoder, instruction_address.As<uint8_t*>(), ZYDIS_MAX_INSTRUCTION_LENGTH, &instr, operands))
-                && instr.mnemonic == ZYDIS_MNEMONIC_MOV
-                && instr.operand_count_visible == 2
-                && operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY
-                && operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE
-                && operands[0].mem.disp.value == vel_offset)
-            {
-                auto* target_address = instruction_address.Offset(instr.raw.imm[0].offset).As<uint8_t*>();
-                if (target_address != address.As<uint8_t*>())
-                    continue;
-
-                if (auto unprotect_guard = safetyhook::unprotect(target_address, sizeof(new_z_velocity)))
-                {
-                    *reinterpret_cast<uint32_t*>(target_address) = new_z_velocity;
-                    FLOG("Successfully patched JumpInWaterVelocityZ @ server+0x%llx", instruction_address.GetPtr() - modules::server->Base());
-                    return;
-                }
-
-                FERROR("Failed to unprotect memory address for patching JumpInWaterVelocityZ");
-            }
-        }
+        WARN("No VFuncs found for CPlayer_MovementServices; falling back to gamedata.");
+        return g_pGameData->GetAddress<void*>("CPlayer_MovementServices::RunCommand");
     }
 
-    WARN("Found pattern for JumpInWaterVelocityZ but failed to validate and patch the instruction.");
+    uintptr_t thread_id_address{};
+#ifdef PLATFORM_WINDOWS
+    thread_id_address = reinterpret_cast<uintptr_t>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetCurrentThreadId"));
+#else
+    thread_id_address = modules::tier0->GetExportByName("ThreadGetCurrentId");
+#endif
+
+    if (thread_id_address == 0) [[unlikely]]
+    {
+        WARN("Failed to resolve thread ID function; falling back to gamedata.");
+        return g_pGameData->GetAddress<void*>("CPlayer_MovementServices::RunCommand");
+    }
+
+    // 'zorf'
+    constexpr uint32_t frozen_hex = 0x7A6F7266;
+    const auto frozen_string = svr_mod->FindString("frozen", true, true);
+
+    std::vector<uintptr_t> zorf_candidates;
+    std::vector<uintptr_t> frozen_candidates;
+    std::vector<uintptr_t> candidate_only_call;
+    std::vector<uintptr_t> candidate_only_marker;
+
+    auto add_candidate = [](std::vector<uintptr_t>& candidates, uintptr_t vfunc) {
+        for (auto candidate : candidates)
+            if (candidate == vfunc)
+                return;
+        candidates.push_back(vfunc);
+    };
+
+    for (uintptr_t vfunc : vfuncs)
+    {
+        auto range = svr_mod->GetFunctionRange(vfunc);
+        if (range == nullptr)
+            continue;
+
+        bool found_call{};
+        bool found_zorf{};
+        bool found_frozen{};
+
+        ZydisUtility::ScanInstructions(range->start, range->end, [&](uintptr_t ip, const ZydisDecodedInstruction& instr, const ZydisDecodedOperand* operands) -> bool {
+            if (found_call && found_zorf && found_frozen)
+                return true;
+
+            if (!found_call && instr.mnemonic == ZYDIS_MNEMONIC_CALL
+                && ZydisUtility::ResolveCallTarget(&instr, operands, ip) == thread_id_address)
+            {
+                found_call = true;
+                return false;
+            }
+
+            if (!found_frozen && frozen_string.IsValid()
+                && instr.mnemonic == ZYDIS_MNEMONIC_LEA
+                && instr.operand_count_visible == 2
+                && operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY
+                && ZydisUtility::GetAbsoluteAddress(instr, operands[1], ip) == frozen_string.GetPtr())
+            {
+                found_frozen = true;
+                return false;
+            }
+
+            if (!found_zorf && instr.mnemonic == ZYDIS_MNEMONIC_MOV && instr.operand_count_visible == 2)
+            {
+                if ((instr.attributes & ZYDIS_ATTRIB_IS_RELATIVE) != 0
+                    && operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY)
+                {
+                    auto abs = ZydisUtility::GetAbsoluteAddress(instr, operands[1], ip);
+                    if (abs != 0 && *reinterpret_cast<uint32_t*>(abs) == frozen_hex)
+                    {
+                        found_zorf = true;
+                        return false;
+                    }
+                }
+                else if (operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && operands[1].imm.value.u == frozen_hex)
+                {
+                    found_zorf = true;
+                    return false;
+                }
+            }
+
+            return false;
+        });
+
+        if (found_call)
+        {
+            if (found_zorf)
+                add_candidate(zorf_candidates, vfunc);
+            if (found_frozen)
+                add_candidate(frozen_candidates, vfunc);
+            if (!found_zorf && !found_frozen)
+                add_candidate(candidate_only_call, vfunc);
+        }
+        else if (found_zorf || found_frozen)
+            add_candidate(candidate_only_marker, vfunc);
+    }
+
+    const bool marker_conflict = frozen_candidates.size() == 1 && zorf_candidates.size() == 1
+                   && frozen_candidates.front() != zorf_candidates.front();
+    if (!marker_conflict && frozen_candidates.size() == 1)
+    {
+        auto vfunc = frozen_candidates.front();
+        FLOG("Found CPlayer_MovementServices::RunCommand using frozen string at server+0x%llx", vfunc - svr_mod->Base());
+        return vfunc;
+    }
+    if (!marker_conflict && zorf_candidates.size() == 1)
+    {
+        auto vfunc = zorf_candidates.front();
+        FLOG("Found CPlayer_MovementServices::RunCommand using zorf at server+0x%llx", vfunc - svr_mod->Base());
+        return vfunc;
+    }
+
+    std::string diag = std::format(
+        "Failed to find CPlayer_MovementServices::RunCommand by scanning virtual functions."
+        "\n  Scanned {} vfuncs from CPlayer_MovementServices vtable."
+        "\n  'zorf' candidates: {}.",
+        vfuncs.size(), zorf_candidates.size());
+    diag += std::format("\n  'frozen' string candidates: {}.", frozen_candidates.size());
+    if (marker_conflict)
+        diag += "\n  The two markers point to different functions.";
+
+    if (!candidate_only_marker.empty())
+    {
+        diag += std::format("\n  -> Found RunCommand marker without ThreadID call in {} function(s):", candidate_only_marker.size());
+        for (auto fn : candidate_only_marker)
+            diag += std::format("\n       server+0x{:x}", fn - svr_mod->Base());
+    }
+
+    if (!candidate_only_call.empty())
+    {
+        diag += std::format("\n  -> Found ThreadID (CALL) without RunCommand marker in {} function(s):", candidate_only_call.size());
+        for (auto fn : candidate_only_call)
+            diag += std::format("\n       server+0x{:x}", fn - svr_mod->Base());
+    }
+
+    diag += "\n  Falling back to gamedata...";
+
+    WARN("%s", diag.c_str());
+
+    return g_pGameData->GetAddress<void*>("CPlayer_MovementServices::RunCommand");
 }
 
 void InstallMovementHook()
 {
-    HOOK(CPlayer_MovementServices, RunCommand);
+    HOOK(CPlayer_MovementServices, RunCommand, {.address = FindCPlayerMovementService_RunCommand()});
 
     HOOK(CCSPlayer_MovementServices, WalkMove);
     HOOK(CCSPlayer_MovementServices, Accelerate);
     HOOK(CCSPlayer_MovementServices, ProcessMove);
 
+    HOOK(CCSPlayer_MovementServices, CheckLegacyJump);
+    HOOK(CCSPlayer_MovementServices, CheckModernJump);
+
     VHOOK(CCSPlayer_MovementServices, CheckMovingGround, server);
 
     HOOK(CCSPlayerController, ProcessUserCommands);
-
-    PatchJumpInWaterVelocityZ();
 
     g_pHookManager->Hook_ClientActivate(HookType_Post, [](PlayerSlot_t slot, const char* name, uint64_t steamId) {
         m_flLaggedMovementValue[slot] = DefaultSpeedValue;
@@ -413,36 +634,51 @@ void InstallMovementHook()
     ms_disable_usercmd_subtick_moves = g_ConVarManager.CreateConVar("ms_disable_usercmd_subtick_moves", false, "Remove subtick moves command in ProcessUserCommands", FCVAR_RELEASE);
     ms_disable_usercmd_subtick_input = g_ConVarManager.CreateConVar("ms_disable_usercmd_subtick_input", false, "Remove subtick input command in ProcessUserCommands", FCVAR_RELEASE);
     ms_fix_usercmd_rapid_fire        = g_ConVarManager.CreateConVar("ms_fix_usercmd_rapid_fire", false, "Fix rapid fire command", FCVAR_RELEASE);
+    ms_water_ground_jump_velocity    = g_ConVarManager.CreateConVar("ms_water_ground_jump_velocity", 145.f, true, 100.f, true, 1000.f, "Vertical velocity when jumping off the ground in waist-deep or deeper water. The engine gives 100, too low to leave the ground.", FCVAR_RELEASE);
+}
+
+static bool TryGetMovementSlot(CCSPlayerController* pController, PlayerSlot_t& slot)
+{
+    if (!pController)
+        return false;
+
+    slot = pController->GetPlayerSlot();
+
+    return slot < CS_MAX_PLAYERS;
 }
 
 void SetPlayerLaggedMovementValue(CCSPlayerController* pController, float flValue)
 {
-    if (!pController)
+    PlayerSlot_t slot;
+    if (!TryGetMovementSlot(pController, slot))
         return;
 
-    m_flLaggedMovementValue[pController->GetPlayerSlot()] = std::clamp(flValue, 0.01f, 5.0f);
+    m_flLaggedMovementValue[slot] = std::clamp(flValue, 0.01f, 5.0f);
 }
 
 void SetPlayerRunSpeedValue(CCSPlayerController* pController, float flValue)
 {
-    if (!pController)
+    PlayerSlot_t slot;
+    if (!TryGetMovementSlot(pController, slot))
         return;
 
-    m_flRunSpeedValue[pController->GetPlayerSlot()] = std::clamp(flValue, 0.01f, 5.0f);
+    m_flRunSpeedValue[slot] = std::clamp(flValue, 0.01f, 5.0f);
 }
 
 float GetPlayerLaggedMovementValue(CCSPlayerController* pController)
 {
-    if (!pController)
-        return 1;
+    PlayerSlot_t slot;
+    if (!TryGetMovementSlot(pController, slot))
+        return DefaultSpeedValue;
 
-    return m_flLaggedMovementValue[pController->GetPlayerSlot()];
+    return m_flLaggedMovementValue[slot];
 }
 
 float GetPlayerRunSpeedValue(CCSPlayerController* pController)
 {
-    if (!pController)
-        return 1;
+    PlayerSlot_t slot;
+    if (!TryGetMovementSlot(pController, slot))
+        return DefaultSpeedValue;
 
-    return m_flRunSpeedValue[pController->GetPlayerSlot()];
+    return m_flRunSpeedValue[slot];
 }

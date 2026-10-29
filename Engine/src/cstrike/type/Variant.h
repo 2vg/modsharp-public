@@ -93,7 +93,7 @@ enum class FieldType_t : uint8_t
     FIELD_ATTACHMENT_HANDLE                             = 0x42,
     FIELD_AMMO_INDEX                                    = 0x43,
     FIELD_CONDITION_ID                                  = 0x44,
-    FIELD_AI_SCHEDULE_BITS                              = 0x45,
+    DEPRECATED_FIELD_AI_SCHEDULE_BITS                   = 0x45,
     FIELD_MODIFIER_HANDLE                               = 0x46,
     FIELD_ROTATION_VECTOR                               = 0x47,
     FIELD_ROTATION_VECTOR_WORLDSPACE                    = 0x48,
@@ -104,7 +104,10 @@ enum class FieldType_t : uint8_t
     FIELD_ENGINE_TICK                                   = 0x4d,
     FIELD_WORLD_GROUP_ID                                = 0x4e,
     FIELD_GLOBALSYMBOL                                  = 0x4f,
-    FIELD_TYPECOUNT                                     = 0x50,
+    FIELD_HNMGRAPHDEFINITION                            = 0x50,
+    FIELD_NETWORK_QUANTIZED_VECTORWS                    = 0x51,
+    FIELD_NETWORK_ORIGIN_CELL_QUANTIZED_VECTORWS        = 0x52,
+    FIELD_TYPECOUNT                                     = 0x53,
 };
 
 class Variant_t
@@ -164,14 +167,11 @@ public:
     [[nodiscard]] bool        Bool() const { return (fieldType == FieldType_t::FIELD_BOOLEAN) ? bVal : false; }
     [[nodiscard]] float       Float() const { return (fieldType == FieldType_t::FIELD_FLOAT32) ? flVal : 0; }
     [[nodiscard]] const char* CString() const { return (fieldType == FieldType_t::FIELD_CSTRING) ? iszVal : nullptr; }
-    [[nodiscard]] const char* String() const { return (fieldType == FieldType_t::FIELD_STRING) ? (pVal ? *reinterpret_cast<char**>(pVal) : nullptr) : nullptr; }
+    [[nodiscard]] const char* String() const { return (fieldType == FieldType_t::FIELD_STRING) ? iszVal : nullptr; }
     [[nodiscard]] const char* AutoString() const
     {
-        if (fieldType == FieldType_t::FIELD_CSTRING)
+        if (fieldType == FieldType_t::FIELD_CSTRING || fieldType == FieldType_t::FIELD_STRING || fieldType == FieldType_t::FIELD_GLOBALSYMBOL)
             return iszVal;
-
-        if (fieldType == FieldType_t::FIELD_STRING || fieldType == FieldType_t::FIELD_GLOBALSYMBOL)
-            return pVal ? *reinterpret_cast<const char**>(pVal) : nullptr;
 
         return nullptr;
     }
@@ -253,12 +253,12 @@ struct KeyValuesVariantValueItem
 {
     KeyValuesVariantValueItemType type;
     union {
-        bool     bValue;
-        int32_t  i32Value;
-        float    flValue;
-        char*    szValue;
-        void*    pValue;
-        uint64_t u64Value;
+        bool        bValue;
+        int32_t     i32Value;
+        float       flValue;
+        const char* szValue;
+        void*       pValue;
+        uint64_t    u64Value;
     };
 
     // 如果是string确保 this alive
@@ -297,7 +297,7 @@ static_assert(sizeof(KeyValuesVariantValueItem) == 16);
 
 struct KeyValuesVariantItem
 {
-    char*                     Key;
+    const char*               Key;
     KeyValuesVariantValueItem Value;
 };
 static_assert(sizeof(KeyValuesVariantItem) == 24);
